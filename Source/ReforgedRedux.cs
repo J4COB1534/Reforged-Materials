@@ -241,8 +241,27 @@ namespace ReforgedRedux
         bool excludedPart;
         bool isFairing;
         int lastRenderCount = -1;
+        internal static readonly HashSet<string> IgnoredParts = new HashSet<string>();
+        internal bool Excluded { get { return excludedPart; } }
+
+        internal static void RefreshIgnored(string partName)
+        {
+            liveModules.RemoveWhere(delegate(ModuleReforged mm) { return mm == null; });
+            List<ModuleReforged> ms = new List<ModuleReforged>(liveModules);
+            for (int i = 0; i < ms.Count; i++)
+            {
+                ModuleReforged m = ms[i];
+                if (m == null || m.part == null || m.part.partInfo == null || m.part.partInfo.name != partName) continue;
+                bool was = m.excludedPart;
+                m.excludedPart = m.ExcludedPart();
+                if (m.excludedPart && !was) { m.RestoreOriginals(); m.FixDecals(); m.UpdateHeatBuff(); }
+                else if (!m.excludedPart && was) { if (m.Active) m.Rebuild(); m.UpdateHeatBuff(); }
+            }
+        }
+
         bool ExcludedPart()
         {
+            if (part.partInfo != null && IgnoredParts.Contains(part.partInfo.name)) return true;
             for (int i = 0; i < part.Modules.Count; i++)
             {
                 string mn = part.Modules[i].moduleName;
@@ -606,7 +625,8 @@ namespace ReforgedRedux
               .Append(" colour=").Append(rdxColored).Append(" mode=").Append(rdxColorMode).Append(" finish=").Append(rdxFinish)
               .Append(" keepShiny=").Append(rdxKeepShiny).Append(" region=").Append(rdxRegion)
               .Append(" detail=").Append(rdxPaintDetail.ToString("0.00")).Append(" texDetail=").Append(rdxTexDetail).Append("\n");
-            sb.Append("  stack=").Append(string.IsNullOrEmpty(rdxStack) ? "-" : rdxStack).Append(" zones=").Append(ParseZones(rdxZones).Count).Append("\n");
+            sb.Append("  stack=").Append(string.IsNullOrEmpty(rdxStack) ? "-" : rdxStack).Append(" zones=").Append(ParseZones(rdxZones).Count)
+              .Append(" paintRes=").Append(WeatherCache.LowVram ? "low" : (WeatherCache.SmallPaintPart(part) ? "small" : "full")).Append("\n");
             sb.Append("  modules:");
             for (int i = 0; i < part.Modules.Count; i++) sb.Append(' ').Append(part.Modules[i].moduleName);
             sb.Append("\n");
@@ -662,6 +682,7 @@ namespace ReforgedRedux
 
         public override void OnStart(StartState state)
         {
+            ReforgedPainter.EnsureSettings();
             liveModules.Add(this);
             excludedPart = ExcludedPart();
             isFairing = false;
@@ -759,6 +780,7 @@ namespace ReforgedRedux
         internal static bool DeferLoadBakes = false;
         internal static bool EvenShine = true;
         internal static bool HeatTileWeight = true;
+        internal static bool HeatTileHeat = true;
         const float TileKgPerM2 = 8f;
 
         static int roState = -1;
@@ -2159,9 +2181,9 @@ namespace ReforgedRedux
         void UpdateHeatBuff(bool notify)
         {
             if (part == null) return;
-            List<Zone> tz = RealismOverhaul ? new List<Zone>() : AllZones().FindAll(delegate(Zone z) { return HasTiles(z.stack); });
+            List<Zone> tz = (RealismOverhaul || excludedPart) ? new List<Zone>() : AllZones().FindAll(delegate(Zone z) { return HasTiles(z.stack); });
             bool heat = tz.Count > 0;
-            SetHeatBuff(heat);
+            SetHeatBuff(heat && HeatTileHeat);
             float mass = 0f;
             if (heat && HeatTileWeight)
             {
@@ -2338,7 +2360,7 @@ namespace ReforgedRedux
         int tab;
         int mode = 1;
         bool includeChildren;
-        bool paintSym;
+        static bool paintSym = true;
         Part lastPaintedPart;
         Rect win = new Rect(300f, 100f, 360f, 520f);
         bool resizing;
@@ -2371,7 +2393,31 @@ namespace ReforgedRedux
         int capturing = -1;
         bool diagPick;
         KeyBind[] draftBinds;
-        bool draftGradual, draftEven, draftWeight;
+        bool draftGradual, draftEven, draftWeight, draftHeat, draftLowVram;
+        int draftCacheLimit;
+        Vector2 setScroll;
+        float setContentH;
+        long cacheBytes = -1;
+        float cacheBytesAt;
+        static readonly int[] CacheLimits = { 0, 500, 1024, 2048, 5120 };
+
+        static string SizeText(long bytes)
+        {
+            double mb = bytes / 1048576.0;
+            if (mb >= 1024.0) return (mb / 1024.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " GB";
+            return mb.ToString("0", System.Globalization.CultureInfo.InvariantCulture) + " MB";
+        }
+
+        static string LimitText(int mb)
+        {
+            if (mb <= 0) return Loc.T("#RDX_NoLimit", "No limit");
+            return (mb >= 1024) ? (mb / 1024) + " GB" : mb + " MB";
+        }
+
+        internal static void EnsureSettings()
+        {
+            if (!presetsLoaded) { LoadPresets(); presetsLoaded = true; }
+        }
         bool capLocked;
         const string CapLockId = "ReforgedReduxKeyCapture";
 
@@ -2385,7 +2431,9 @@ namespace ReforgedRedux
             new KeyBind("undo", KeyCode.None),
             new KeyBind("redo", KeyCode.None),
             new KeyBind("resetBrush", KeyCode.None),
-            new KeyBind("toggleMenu", KeyCode.None)
+            new KeyBind("toggleMenu", KeyCode.None),
+            new KeyBind("pick", KeyCode.Mouse2),
+            new KeyBind("pin", KeyCode.Mouse1)
         };
         static KeyBind Bind(string id) { for (int i = 0; i < binds.Length; i++) if (binds[i].id == id) return binds[i]; return null; }
 
@@ -2397,14 +2445,30 @@ namespace ReforgedRedux
                 case "undo": return Loc.T("#RDX_KeyUndo", "Undo");
                 case "redo": return Loc.T("#RDX_KeyRedo", "Redo");
                 case "resetBrush": return Loc.T("#RDX_KeyResetBrush", "Reset brush to stock");
+                case "pick": return Loc.T("#RDX_KeyPick", "Pick piece");
+                case "pin": return Loc.T("#RDX_KeyPin", "Pin preview");
                 default: return Loc.T("#RDX_KeyToggleMenu", "Show / hide menu");
             }
+        }
+
+        static string KeyName(KeyCode k)
+        {
+            if (k == KeyCode.Mouse1) return Loc.T("#RDX_MouseRight", "Right mouse");
+            if (k == KeyCode.Mouse2) return Loc.T("#RDX_MouseMiddle", "Middle mouse");
+            if (k >= KeyCode.Mouse3 && k <= KeyCode.Mouse6) return Loc.T("#RDX_MouseN", "Mouse <<1>>", ((int)k - (int)KeyCode.Mouse0 + 1).ToString());
+            return k.ToString();
+        }
+
+        static string BindName(string id)
+        {
+            KeyBind b = Bind(id);
+            return (b != null) ? BindText(b) : "";
         }
 
         static string BindText(KeyBind b)
         {
             if (b.key == KeyCode.None) return Loc.T("#RDX_KeyNone", "None");
-            string t = b.key.ToString();
+            string t = KeyName(b.key);
             if (b.alt) t = "Alt+" + t;
             if (b.shift) t = "Shift+" + t;
             if (b.ctrl) t = "Ctrl+" + t;
@@ -2464,6 +2528,40 @@ namespace ReforgedRedux
             return win.Contains(mp) || (settingsOpen && setWin.Contains(mp));
         }
 
+        static Part PartUnderMouse()
+        {
+            Part p = Mouse.HoveredPart;
+            if (p == null)
+            {
+                Camera cam = Camera.main;
+                RaycastHit hit;
+                if (cam != null && Physics.Raycast(cam.ScreenPointToRay(Input.mousePosition), out hit, 10000f))
+                    p = hit.collider.GetComponentInParent<Part>();
+            }
+            return p;
+        }
+
+        static string PartTitle(string partName)
+        {
+            AvailablePart ap = PartLoader.getPartInfoByName(partName);
+            return (ap != null && !string.IsNullOrEmpty(ap.title)) ? ap.title : partName;
+        }
+
+        void IgnorePartUnderMouse()
+        {
+            Part p = PartUnderMouse();
+            if (p == null || p.partInfo == null)
+            {
+                ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgNoPartHit", "No part there. Try again."), 3f, ScreenMessageStyle.UPPER_CENTER);
+                return;
+            }
+            string pn = p.partInfo.name;
+            ModuleReforged.IgnoredParts.Add(pn);
+            SavePresets();
+            ModuleReforged.RefreshIgnored(pn);
+            ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgIgnored", "Ignored: <<1>>. Reforged won't paint this part type.", PartTitle(pn)), 4f, ScreenMessageStyle.UPPER_CENTER);
+        }
+
         void ReportPartUnderMouse()
         {
             Part p = Mouse.HoveredPart;
@@ -2476,7 +2574,7 @@ namespace ReforgedRedux
             }
             if (p == null)
             {
-                ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgNoPartHit", "No part there. Click Report a part to try again."), 3f, ScreenMessageStyle.UPPER_CENTER);
+                ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgNoPartHit", "No part there. Try again."), 3f, ScreenMessageStyle.UPPER_CENTER);
                 return;
             }
             string title = (p.partInfo != null) ? p.partInfo.title : p.name;
@@ -2489,7 +2587,7 @@ namespace ReforgedRedux
         void SetMenuShown(bool v)
         {
             show = v;
-            if (!v) { settingsOpen = false; capturing = -1; diagPick = false; draftBinds = null; }
+            if (!v) { settingsOpen = false; capturing = -1; diagPick = false; ignorePick = false; draftBinds = null; }
             if (button != null) { if (v) button.SetTrue(false); else button.SetFalse(false); }
         }
 
@@ -2512,6 +2610,10 @@ namespace ReforgedRedux
             draftGradual = ModuleReforged.DeferLoadBakes;
             draftEven = ModuleReforged.EvenShine;
             draftWeight = ModuleReforged.HeatTileWeight;
+            draftHeat = ModuleReforged.HeatTileHeat;
+            draftLowVram = WeatherCache.LowVram;
+            draftCacheLimit = WeatherCache.CacheLimitMB;
+            cacheBytes = -1;
         }
 
         bool SettingsChanged()
@@ -2522,7 +2624,8 @@ namespace ReforgedRedux
                 KeyBind a = binds[i], d = draftBinds[i];
                 if (a.key != d.key || a.ctrl != d.ctrl || a.shift != d.shift || a.alt != d.alt) return true;
             }
-            return draftGradual != ModuleReforged.DeferLoadBakes || draftEven != ModuleReforged.EvenShine || draftWeight != ModuleReforged.HeatTileWeight;
+            return draftGradual != ModuleReforged.DeferLoadBakes || draftEven != ModuleReforged.EvenShine || draftWeight != ModuleReforged.HeatTileWeight
+                || draftHeat != ModuleReforged.HeatTileHeat || draftLowVram != WeatherCache.LowVram || draftCacheLimit != WeatherCache.CacheLimitMB;
         }
 
         void SaveSettings()
@@ -2535,31 +2638,41 @@ namespace ReforgedRedux
             ModuleReforged.DeferLoadBakes = draftGradual;
             bool shineChanged = draftEven != ModuleReforged.EvenShine;
             ModuleReforged.EvenShine = draftEven;
-            bool weightChanged = draftWeight != ModuleReforged.HeatTileWeight;
+            bool weightChanged = draftWeight != ModuleReforged.HeatTileWeight || draftHeat != ModuleReforged.HeatTileHeat;
             ModuleReforged.HeatTileWeight = draftWeight;
+            ModuleReforged.HeatTileHeat = draftHeat;
+            bool vramChanged = draftLowVram != WeatherCache.LowVram;
+            WeatherCache.LowVram = draftLowVram;
+            bool limitChanged = draftCacheLimit != WeatherCache.CacheLimitMB;
+            WeatherCache.CacheLimitMB = draftCacheLimit;
             capturing = -1;
             SavePresets();
-            if (shineChanged) ModuleReforged.RebuildAllPainted();
+            if (shineChanged || vramChanged) ModuleReforged.RebuildAllPainted();
             if (weightChanged) ModuleReforged.UpdateAllHeat();
+            if (limitChanged) { WeatherCache.TrimDiskCache(); cacheBytes = -1; }
             ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgSettingsSaved", "Settings saved."), 2f, ScreenMessageStyle.UPPER_CENTER);
         }
 
-        void CloseSettings() { settingsOpen = false; capturing = -1; diagPick = false; draftBinds = null; }
+        void CloseSettings() { settingsOpen = false; capturing = -1; diagPick = false; ignorePick = false; draftBinds = null; }
 
         void DrawSettings(int id)
         {
             if (draftBinds == null) OpenSettingsDraft();
+            GUILayout.BeginVertical();
+            float maxH = Mathf.Max(240f, Screen.height / uiScale - 140f);
+            bool scroll = setContentH > maxH;
+            if (scroll) setScroll = GUILayout.BeginScrollView(setScroll, GUILayout.Height(maxH));
             GUILayout.BeginVertical();
             Header(Loc.T("#RDX_HdrKeybinds", "Keybinds"));
             for (int i = 0; i < draftBinds.Length; i++)
             {
                 GUILayout.BeginHorizontal();
                 GUILayout.Label(BindLabel(draftBinds[i].id), builderLabel, GUILayout.Width(150f));
-                string txt = (capturing == i) ? Loc.T("#RDX_KeyPress", "Press a key...") : BindText(draftBinds[i]);
+                string txt = (capturing == i) ? Loc.T("#RDX_KeyPress", "Press a key or mouse button...") : BindText(draftBinds[i]);
                 if (GUILayout.Button(txt, GUILayout.Height(22f))) capturing = (capturing == i) ? -1 : i;
                 GUILayout.EndHorizontal();
             }
-            Hint(Loc.T("#RDX_HintKeybinds", "Click a key, then press the new one.\nEsc cancels, Backspace clears it."));
+            Hint(Loc.T("#RDX_HintKeybinds", "Click a bind, then press a key or mouse button.\nEsc cancels, Backspace clears it."));
             GUILayout.Space(4f);
             Header(Loc.T("#RDX_HdrPaint", "Paint"));
             draftEven = GUILayout.Toggle(draftEven, Loc.T("#RDX_EvenShine", "Even paint shine"));
@@ -2570,32 +2683,79 @@ namespace ReforgedRedux
             {
                 GUI.enabled = false;
                 GUILayout.Toggle(false, Loc.T("#RDX_TileWeight", "Heat tiles add weight"));
+                GUILayout.Toggle(false, Loc.T("#RDX_TileHeat", "Heat tiles add heat tolerance"));
                 GUI.enabled = true;
                 GUILayout.Label(Loc.T("#RDX_HintRO", "Realism Overhaul found: heat tiles are looks only.\nThey don't change heat tolerance or weight."), hintStyle);
             }
             else
             {
                 draftWeight = GUILayout.Toggle(draftWeight, Loc.T("#RDX_TileWeight", "Heat tiles add weight"));
-                Hint(Loc.T("#RDX_HintTileWeight", "Heat tiles weigh about 8 kg per square metre they cover.\nThey always raise the part's heat tolerance."));
+                draftHeat = GUILayout.Toggle(draftHeat, Loc.T("#RDX_TileHeat", "Heat tiles add heat tolerance"));
+                Hint(Loc.T("#RDX_HintTileWeight", "Weight: about 8 kg per square metre of tiles.\nHeat tolerance: the part can take 2.5x more heat."));
             }
             GUILayout.Space(4f);
-            Header(Loc.T("#RDX_HdrLoading", "Loading"));
+            Header(Loc.T("#RDX_HdrPerformance", "Performance"));
             draftGradual = GUILayout.Toggle(draftGradual, Loc.T("#RDX_GradualLoad", "Load painted crafts gradually"));
             Hint(Loc.T("#RDX_HintGradualLoad", "Off: a short pause, then the craft appears fully painted.\nOn: the craft appears right away and the paint fills in."));
+            draftLowVram = GUILayout.Toggle(draftLowVram, Loc.T("#RDX_LowVram", "Low VRAM mode"));
+            Hint(Loc.T("#RDX_HintLowVram", "Paint uses about 75% less graphics memory and\npaints faster, but looks softer up close."));
             GUILayout.Space(4f);
             Header(Loc.T("#RDX_HdrTrouble", "Troubleshooting"));
-            if (GUILayout.Button(diagPick ? Loc.T("#RDX_MsgClickPart", "Click the part you want to report.") : Loc.T("#RDX_ReportPart", "Report a part"), GUILayout.Height(22f)))
+            if (GUILayout.Button(diagPick ? Loc.T("#RDX_MsgClickPart", "Point at the part to report and press <<1>>.", BindName("pick")) : Loc.T("#RDX_ReportPart", "Report a part"), GUILayout.Height(22f)))
             {
                 diagPick = !diagPick;
-                if (diagPick) ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgClickPart", "Click the part you want to report."), 3f, ScreenMessageStyle.UPPER_CENTER);
+                ignorePick = false;
+                if (diagPick) ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgClickPart", "Point at the part to report and press <<1>>.", BindName("pick")), 3f, ScreenMessageStyle.UPPER_CENTER);
             }
-            Hint(Loc.T("#RDX_HintTrouble", "Click, then click a part that paints wrongly.\nA report is written to KSP.log for support."));
+            Hint(Loc.T("#RDX_HintTrouble", "For a part that paints wrongly. A report is\nwritten to KSP.log for support.", BindName("pick")));
+            if (GUILayout.Button(ignorePick ? Loc.T("#RDX_MsgIgnorePick", "Point at the part to ignore and press <<1>>.", BindName("pick")) : Loc.T("#RDX_IgnorePart", "Ignore a part"), GUILayout.Height(22f)))
+            {
+                ignorePick = !ignorePick;
+                diagPick = false;
+                if (ignorePick) ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgIgnorePick", "Point at the part to ignore and press <<1>>.", BindName("pick")), 3f, ScreenMessageStyle.UPPER_CENTER);
+            }
+            Hint(Loc.T("#RDX_HintIgnore", "Reforged stops painting that part type completely.\nHandy if a part from another mod looks wrong."));
+            if (ModuleReforged.IgnoredParts.Count > 0)
+            {
+                GUILayout.Label(Loc.T("#RDX_IgnoredParts", "Ignored parts:"), builderLabel);
+                List<string> ign = new List<string>(ModuleReforged.IgnoredParts);
+                ign.Sort();
+                string drop = null;
+                for (int i = 0; i < ign.Count; i++)
+                {
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Label(PartTitle(ign[i]), builderLabel);
+                    if (GUILayout.Button("x", GUILayout.Width(24f), GUILayout.Height(20f))) drop = ign[i];
+                    GUILayout.EndHorizontal();
+                }
+                Hint(Loc.T("#RDX_HintIgnoredList", "Press x to let that part be painted again."));
+                if (drop != null)
+                {
+                    ModuleReforged.IgnoredParts.Remove(drop);
+                    SavePresets();
+                    ModuleReforged.RefreshIgnored(drop);
+                    ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgUnignored", "<<1>> can be painted again.", PartTitle(drop)), 3f, ScreenMessageStyle.UPPER_CENTER);
+                }
+            }
+            if (cacheBytes < 0 || Time.realtimeSinceStartup >= cacheBytesAt)
+            {
+                cacheBytes = WeatherCache.DiskCacheBytes();
+                cacheBytesAt = Time.realtimeSinceStartup + 5f;
+            }
+            GUILayout.Label(Loc.T("#RDX_CacheSize", "Paint cache: <<1>>", SizeText(cacheBytes)), builderLabel);
             if (GUILayout.Button(Loc.T("#RDX_ClearCache", "Clear paint cache"), GUILayout.Height(22f)))
             {
                 WeatherCache.ClearDiskCache();
+                cacheBytes = -1;
                 ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgCacheCleared", "Paint cache cleared."), 2f, ScreenMessageStyle.UPPER_CENTER);
             }
             Hint(Loc.T("#RDX_HintCache", "Paint is saved so crafts load faster next time.\nClear it if a painted part ever looks wrong."));
+            if (GUILayout.Button(Loc.T("#RDX_CacheLimit", "Cache limit: <<1>>", LimitText(draftCacheLimit)), GUILayout.Height(22f)))
+            {
+                int li = Array.IndexOf(CacheLimits, draftCacheLimit);
+                draftCacheLimit = CacheLimits[(li + 1) % CacheLimits.Length];
+            }
+            Hint(Loc.T("#RDX_HintCacheLimit", "When the cache gets bigger than this, the oldest\npaint is removed. It is rebuilt when needed."));
             GUILayout.Space(6f);
             if (GUILayout.Button(Loc.T("#RDX_ResetDefaults", "Reset to defaults"), GUILayout.Height(22f)))
             {
@@ -2603,8 +2763,14 @@ namespace ReforgedRedux
                 draftGradual = false;
                 draftEven = true;
                 draftWeight = true;
+                draftHeat = true;
+                draftLowVram = false;
+                draftCacheLimit = 0;
                 capturing = -1;
             }
+            GUILayout.EndVertical();
+            if (Event.current.type == EventType.Repaint) setContentH = GUILayoutUtility.GetLastRect().height;
+            if (scroll) GUILayout.EndScrollView();
             bool changed = SettingsChanged();
             GUILayout.BeginHorizontal();
             GUI.enabled = changed;
@@ -2626,6 +2792,7 @@ namespace ReforgedRedux
         Texture2D svTex, hueTex, markTex;
         int svHueKey = -1;
         bool eyedrop;
+        bool ignorePick;
         bool meshPick;
         string pickId;
         Part pickPart;
@@ -2649,7 +2816,7 @@ namespace ReforgedRedux
         readonly List<List<UndoEntry>> redoStack = new List<List<UndoEntry>>();
         const int UndoCap = 12;
 
-        public const string Version = "1.1.1";
+        public const string Version = "1.1.2";
         static bool versionLogged;
 
         void Start()
@@ -2684,7 +2851,7 @@ namespace ReforgedRedux
             if (icon == null) { icon = new Texture2D(38, 38); }
             button = ApplicationLauncher.Instance.AddModApplication(
                 delegate { show = true; },
-                delegate { show = false; settingsOpen = false; capturing = -1; diagPick = false; draftBinds = null; },
+                delegate { show = false; settingsOpen = false; capturing = -1; diagPick = false; ignorePick = false; draftBinds = null; },
                 null, null, null, null,
                 ApplicationLauncher.AppScenes.SPH | ApplicationLauncher.AppScenes.VAB | ApplicationLauncher.AppScenes.FLIGHT,
                 icon);
@@ -2723,21 +2890,37 @@ namespace ReforgedRedux
 
         void Update()
         {
+            if (capturing >= 0 && draftBinds != null && capturing < draftBinds.Length)
+            {
+                for (int mb = 1; mb <= 6; mb++)
+                {
+                    KeyCode mk = (KeyCode)((int)KeyCode.Mouse0 + mb);
+                    if (!Input.GetKeyDown(mk)) continue;
+                    KeyBind cb = draftBinds[capturing];
+                    cb.key = mk;
+                    cb.ctrl = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
+                    cb.shift = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
+                    cb.alt = Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
+                    capturing = -1;
+                    return;
+                }
+            }
             if (Mouse.HoveredPart != null) lastHovered = Mouse.HoveredPart;
             if (colPrevPending || colPrevWasDrag) FlushColourPreview();
             if (settingsDirty && !Input.GetMouseButton(0)) { settingsDirty = false; SavePresets(); }
 
-            if (show && !regWhole && Input.GetMouseButtonDown(1))
+            if (show && !regWhole && capturing < 0 && BindDown("pin") && !MouseOverMenus())
             {
                 Part hp = Mouse.HoveredPart;
                 if (hp != null) ovLocked = (ovLocked == hp) ? null : hp;
             }
             if (regWhole) ovLocked = null;
             DrawRegionOverlay();
-            if (diagPick && Input.GetMouseButtonDown(0) && !MouseOverMenus())
+            if ((diagPick || ignorePick) && capturing < 0 && BindDown("pick") && !MouseOverMenus())
             {
-                diagPick = false;
-                ReportPartUnderMouse();
+                bool ig = ignorePick;
+                diagPick = false; ignorePick = false;
+                if (ig) IgnorePartUnderMouse(); else ReportPartUnderMouse();
                 return;
             }
             if (eyedrop && Input.GetMouseButtonDown(0))
@@ -2746,7 +2929,7 @@ namespace ReforgedRedux
                 StartCoroutine(SamplePixel(Input.mousePosition));
                 return;
             }
-            if (meshPick && Input.GetMouseButtonDown(2))
+            if (meshPick && capturing < 0 && BindDown("pick") && !MouseOverMenus())
             {
                 meshPick = false;
                 DoMeshPick(Input.mousePosition);
@@ -2945,7 +3128,7 @@ namespace ReforgedRedux
         void DoMeshPick(Vector3 mousePos)
         {
             Part part = Mouse.HoveredPart;
-            if (part == null) { ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgPointPart", "Point at a part first, then click."), 3f, ScreenMessageStyle.UPPER_CENTER); return; }
+            if (part == null) { ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgPointPart", "Point at a part first, then press <<1>>.", BindName("pick")), 3f, ScreenMessageStyle.UPPER_CENTER); return; }
             Camera cam = Camera.main;
             if (cam == null) return;
             Ray ray = cam.ScreenPointToRay(mousePos);
@@ -3123,7 +3306,7 @@ namespace ReforgedRedux
             for (int i = 0; i < parts.Count; i++)
             {
                 ModuleReforged mod = parts[i].Modules.GetModule<ModuleReforged>();
-                if (mod == null) continue;
+                if (mod == null || mod.Excluded) continue;
                 if (craftCut && !PartInCraftCut(parts[i])) continue;
                 if (pickId != null && pickPart != null && parts[i].partInfo != pickPart.partInfo) continue;
                 mod.rdxKeepShiny = uiKeepShiny;
@@ -3486,14 +3669,14 @@ namespace ReforgedRedux
             else if (nmode == 2)
             {
                 if (pickId == null)
-                    Hint(Loc.T("#RDX_HintPick", "Middle-click a coloured piece to select just that piece, then paint it.\nEach separate piece has its own colour. A part drawn as one piece can't be split."));
+                    Hint(Loc.T("#RDX_HintPick", "Point at a coloured piece and press <<1>> to select it, then paint it.\nEach separate piece has its own colour. A part drawn as one piece can't be split.", BindName("pick")));
                 else if (GUILayout.Button(Loc.T("#RDX_PickAgain", "Pick a different piece"), GUILayout.Height(20f)))
                 { pickId = null; pickPart = null; meshPick = true; ch = true; }
             }
             if (nmode != 0)
             {
                 showOverlay = GUILayout.Toggle(showOverlay, "<b>" + Loc.T("#RDX_ShowPreview", "Show preview") + "</b>", toggleBold);
-                Hint((showOverlay && ovLocked != null ? Loc.T("#RDX_PreviewPinned", "Preview PINNED.") + " " : "") + Loc.T("#RDX_HintPreview", "Highlights where the paint will land.\nRight-click a part to pin/unpin the preview."));
+                Hint((showOverlay && ovLocked != null ? Loc.T("#RDX_PreviewPinned", "Preview PINNED.") + " " : "") + Loc.T("#RDX_HintPreview", "Highlights where the paint will land.\nPoint at a part and press <<1>> to pin/unpin the preview.", BindName("pin")));
             }
             return ch;
         }
@@ -3635,7 +3818,7 @@ namespace ReforgedRedux
         void ManageInputLock()
         {
             Vector2 mpos = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y) / uiScale;
-            bool clickPick = eyedrop || diagPick;
+            bool clickPick = eyedrop || diagPick || ignorePick;
             bool over = show && (clickPick || win.Contains(mpos) || (settingsOpen && setWin.Contains(mpos)));
 
             if (over && (!inputLocked || lockedEyedrop != clickPick))
@@ -3655,23 +3838,7 @@ namespace ReforgedRedux
                 InputLockManager.RemoveControlLock(LockId);
                 inputLocked = false; lockedEyedrop = false;
             }
-
-            bool regBlock = show && !regWhole && showOverlay && Mouse.HoveredPart != null;
-            if (regBlock && !regLocked)
-            {
-                InputLockManager.SetControlLock(
-                    HighLogic.LoadedSceneIsEditor ? ControlTypes.EDITOR_UI : (ControlTypes.All & ~ControlTypes.CAMERACONTROLS),
-                    RegLockId);
-                regLocked = true;
-            }
-            else if (!regBlock && regLocked)
-            {
-                InputLockManager.RemoveControlLock(RegLockId);
-                regLocked = false;
-            }
         }
-        bool regLocked;
-        const string RegLockId = "ReforgedReduxRegion";
 
         void OnGUI()
         {
@@ -3814,7 +3981,8 @@ namespace ReforgedRedux
                 GUILayout.Label(Loc.T("#RDX_PressHovered", "Press P to paint the hovered part."), pressStyle);
                 includeChildren = GUILayout.Toggle(includeChildren, "<b>" + Loc.T("#RDX_IncludeAttached", "Include attached parts") + "</b>", toggleBold);
                 Hint(Loc.T("#RDX_HintAttached", "Also paints the parts attached onto the hovered part."));
-                paintSym = GUILayout.Toggle(paintSym, "<b>" + Loc.T("#RDX_SymmetryPaint", "Symmetry paint") + "</b>", toggleBold);
+                bool nSym = GUILayout.Toggle(paintSym, "<b>" + Loc.T("#RDX_SymmetryPaint", "Symmetry paint") + "</b>", toggleBold);
+                if (nSym != paintSym) { paintSym = nSym; SavePresets(); }
                 Hint(Loc.T("#RDX_HintSym", "Also paints the part's symmetry copies."));
             }
             GUILayout.Space(4f);
@@ -4733,6 +4901,17 @@ namespace ReforgedRedux
                 { string gl = root.GetValue("gradualLoad"); if (gl != null) ModuleReforged.DeferLoadBakes = gl == "True"; }
                 { string es = root.GetValue("evenShine"); if (es != null) ModuleReforged.EvenShine = es != "False"; }
                 { string tw = root.GetValue("heatTileWeight"); if (tw != null) ModuleReforged.HeatTileWeight = tw != "False"; }
+                { string th = root.GetValue("heatTileHeat"); if (th != null) ModuleReforged.HeatTileHeat = th != "False"; }
+                { string lv = root.GetValue("lowVram"); if (lv != null) WeatherCache.LowVram = lv == "True"; }
+                { int cl; if (int.TryParse(root.GetValue("cacheLimitMB"), out cl) && Array.IndexOf(CacheLimits, cl) >= 0) WeatherCache.CacheLimitMB = cl; }
+                { string sy = root.GetValue("symPaint"); if (sy != null) paintSym = sy != "False"; }
+                ModuleReforged.IgnoredParts.Clear();
+                ConfigNode[] igs = root.GetNodes("REDUX_IGNORE");
+                for (int i = 0; i < igs.Length; i++)
+                {
+                    string ipn = igs[i].GetValue("name");
+                    if (!string.IsNullOrEmpty(ipn)) ModuleReforged.IgnoredParts.Add(ipn);
+                }
                 for (int bi = 0; bi < binds.Length; bi++) BindLoad(binds[bi], root.GetValue("key_" + binds[bi].id));
                 userFinish.Clear(); userColor.Clear(); userCombo.Clear(); pinned.Clear();
                 ConfigNode[] cs = root.GetNodes("REDUX_COMBO");
@@ -4819,6 +4998,11 @@ namespace ReforgedRedux
                 root.AddValue("gradualLoad", ModuleReforged.DeferLoadBakes);
                 root.AddValue("evenShine", ModuleReforged.EvenShine);
                 root.AddValue("heatTileWeight", ModuleReforged.HeatTileWeight);
+                root.AddValue("heatTileHeat", ModuleReforged.HeatTileHeat);
+                root.AddValue("lowVram", WeatherCache.LowVram);
+                root.AddValue("cacheLimitMB", WeatherCache.CacheLimitMB);
+                root.AddValue("symPaint", paintSym);
+                foreach (string ipn in ModuleReforged.IgnoredParts) root.AddNode("REDUX_IGNORE").AddValue("name", ipn);
                 for (int bi = 0; bi < binds.Length; bi++) root.AddValue("key_" + binds[bi].id, BindSave(binds[bi]));
                 string path = PresetsPath();
                 string dir = System.IO.Path.GetDirectoryName(path);
@@ -5512,10 +5696,60 @@ namespace ReforgedRedux
             }
         }
 
+        internal static int CacheLimitMB = 0;
+        static int writesSinceTrim;
+        static int trimming;
+
+        internal static long DiskCacheBytes()
+        {
+            string dir = CacheDir();
+            if (dir == "") return 0;
+            long n = 0;
+            try
+            {
+                foreach (string f in System.IO.Directory.GetFiles(dir, "*.bin"))
+                {
+                    try { n += new System.IO.FileInfo(f).Length; } catch { }
+                }
+            }
+            catch { }
+            return n;
+        }
+
+        internal static void TrimDiskCache()
+        {
+            long lim = CacheLimitMB * 1048576L;
+            if (lim <= 0) return;
+            string dir = CacheDir();
+            if (dir == "") return;
+            if (System.Threading.Interlocked.Exchange(ref trimming, 1) == 1) return;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate(object o)
+            {
+                try
+                {
+                    System.IO.FileInfo[] fs = new System.IO.DirectoryInfo(dir).GetFiles("*.bin");
+                    long total = 0;
+                    for (int i = 0; i < fs.Length; i++) total += fs[i].Length;
+                    if (total > lim)
+                    {
+                        Array.Sort(fs, delegate(System.IO.FileInfo a, System.IO.FileInfo b) { return a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc); });
+                        long target = lim / 10 * 9;
+                        for (int i = 0; i < fs.Length && total > target; i++)
+                        {
+                            try { long len = fs[i].Length; fs[i].Delete(); total -= len; } catch { }
+                        }
+                    }
+                }
+                catch { }
+                finally { System.Threading.Interlocked.Exchange(ref trimming, 0); }
+            });
+        }
+
         static void DiskWrite(string file, byte[] payload)
         {
             string dir = CacheDir();
             if (dir == "" || payload == null) return;
+            if (++writesSinceTrim >= 16) { writesSinceTrim = 0; TrimDiskCache(); }
             string path = dir + file + ".bin";
             System.Threading.ThreadPool.QueueUserWorkItem(delegate(object o)
             {
@@ -5535,7 +5769,13 @@ namespace ReforgedRedux
             string dir = CacheDir();
             if (dir == "") return null;
             string path = dir + file + ".bin";
-            try { return System.IO.File.Exists(path) ? System.IO.File.ReadAllBytes(path) : null; }
+            try
+            {
+                if (!System.IO.File.Exists(path)) return null;
+                byte[] d = System.IO.File.ReadAllBytes(path);
+                if (CacheLimitMB > 0) { try { System.IO.File.SetLastWriteTimeUtc(path, DateTime.UtcNow); } catch { } }
+                return d;
+            }
             catch { return null; }
         }
 
@@ -6091,6 +6331,27 @@ namespace ReforgedRedux
         static readonly Dictionary<int, Texture2D> blitCopies = new Dictionary<int, Texture2D>();
 
         static int lastSweepCount;
+
+        internal static bool LowVram;
+        static float bakeShrink = 1f;
+
+        const float SmallSpanM = 2f;
+
+        internal static bool SmallPaintPart(Part part)
+        {
+            if (part == null) return false;
+            float[] us = UvWorldScale(part);
+            return us != null && Mathf.Max(us[0], us[1]) < SmallSpanM;
+        }
+
+        static void BakeDims(Texture orig, bool small, out int w, out int h, out float shrink)
+        {
+            int scale = 1;
+            while (Mathf.Max(orig.width, orig.height) * scale < 2048 && scale < 4) scale *= 2;
+            w = Mathf.Max(4, orig.width * scale); h = Mathf.Max(4, orig.height * scale); shrink = 1f;
+            if (!LowVram && !small) return;
+            while (Mathf.Max(w, h) > 1024 && w >= 8 && h >= 8) { w /= 2; h /= 2; shrink *= 0.5f; }
+        }
         public static bool IsBaked(Texture t) { return t != null && bakedToOrig.ContainsKey(t.GetInstanceID()); }
         public static bool TryFadeMask(string key, out float[] m) { return masks.TryGetValue(key, out m); }
         public static void PutFadeMask(string key, float[] m) { masks[key] = m; }
@@ -6217,7 +6478,7 @@ namespace ReforgedRedux
                 for (int x = 0; x < w; x++) { Color32 c = bp[row + x]; lum[row + x] = (byte)(c.r * 0.299f + c.g * 0.587f + c.b * 0.114f); }
             });
             byte[] tmp = new byte[n];
-            int r = PaintBlurRadius;
+            int r = Mathf.Max(2, Mathf.RoundToInt(PaintBlurRadius * bakeShrink));
             ForRows(h, par, delegate(int y)
             {
                 int row = y * w;
@@ -6268,10 +6529,10 @@ namespace ReforgedRedux
         {
             if (orig == null) return null;
             Texture2D t;
-            if (blitCopies.TryGetValue(orig.GetInstanceID(), out t) && t != null) return t;
-            int scale = 1;
-            while (Mathf.Max(orig.width, orig.height) * scale < 2048 && scale < 4) scale *= 2;
-            int w = Mathf.Max(4, orig.width * scale), h = Mathf.Max(4, orig.height * scale);
+            int bk = orig.GetInstanceID() ^ (LowVram ? 0x40000000 : 0);
+            if (blitCopies.TryGetValue(bk, out t) && t != null) return t;
+            int w, h; float sk;
+            BakeDims(orig, false, out w, out h, out sk);
             RenderTexture rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32);
             Graphics.Blit(orig, rt);
             RenderTexture prev = RenderTexture.active; RenderTexture.active = rt;
@@ -6279,7 +6540,7 @@ namespace ReforgedRedux
             t.ReadPixels(new Rect(0, 0, w, h), 0, 0);
             t.Apply(true, false);
             RenderTexture.active = prev; RenderTexture.ReleaseTemporary(rt);
-            blitCopies[orig.GetInstanceID()] = t;
+            blitCopies[bk] = t;
             return t;
         }
         static int MaskHash(float[] m)
@@ -6361,6 +6622,9 @@ namespace ReforgedRedux
             if (maskOverride != null) sig += "|k" + MaskHash(maskOverride);
             if (hasPaint) sig += "|pd" + PaintDetailCur.ToString("0.00");
             if (TexSkipCur && hasTexLayer) sig += "|ts";
+            bool smallRes = !LowVram && SmallPaintPart(part);
+            if (LowVram) sig += "|lv";
+            else if (smallRes) sig += "|sr";
             string pkey = partFree ? "*" : (pname + "|s" + patScale.ToString("0.00") + (mir ? "|m" : "") + (uvs != null ? "|t" + uvs[0].ToString("0.000") + "," + uvs[1].ToString("0.000") + (uvs[2] > 0.5f ? "w" : "") + (uvs[3] > 0.5f ? "h" : "") : ""));
             string key = orig.GetInstanceID() + "|" + stackSpec + "|" + pkey + sig;
             string memKey = orig.GetInstanceID() + "|" + pkey + sig;
@@ -6406,9 +6670,8 @@ namespace ReforgedRedux
             }
             try
             {
-                int scale = 1;
-                while (Mathf.Max(orig.width, orig.height) * scale < 2048 && scale < 4) scale *= 2;
-                int w = Mathf.Max(4, orig.width * scale), h = Mathf.Max(4, orig.height * scale);
+                int w, h;
+                BakeDims(orig, smallRes, out w, out h, out bakeShrink);
 
                 string[] entries = stackSpec.Split(';');
 
@@ -6496,7 +6759,7 @@ namespace ReforgedRedux
                         float tm = TileMeters(name) * layerScale;
                         tilesU = Mathf.Max(0.01f, uvs[0] / tm);
                         tilesV = Mathf.Max(0.01f, uvs[1] / tm);
-                        float lim = Mathf.Min(1f, Mathf.Min(w / 160f / tilesU, h / 160f / tilesV));
+                        float lim = Mathf.Min(1f, Mathf.Min(w / bakeShrink / 160f / tilesU, h / bakeShrink / 160f / tilesV));
                         tilesU = Mathf.Clamp(tilesU * lim, 0.2f, 24f);
                         tilesV = Mathf.Clamp(tilesV * lim, 0.2f, 24f);
                         if (uvs[2] > 0.5f) tilesU = Mathf.Max(1f, Mathf.Round(tilesU));
@@ -6706,6 +6969,7 @@ namespace ReforgedRedux
         {
             ModuleReforged.ClearLoadQueue();
             WeatherCache.ClearAllBakes();
+            WeatherCache.TrimDiskCache();
         }
 
         float nextDecalCheck;

@@ -19,7 +19,7 @@ Drop the `ReforgedRedux` folder into your `GameData` folder.
 
 ## Good to know
 - Heat tiles give the part extra heat tolerance while they're on, and add a little weight
-  (about 8 kg per square metre they cover). You can turn the weight off in Settings.
+  (about 8 kg per square metre they cover). You can turn the weight and the extra heat tolerance off in Settings.
 - Painted textures are saved in `GameData/ReforgedRedux/PluginData/BakeCache` so crafts load
   faster next time. If a painted part ever looks wrong, use Clear paint cache in Settings.
 - Reset to stock is a real reset. The mod keeps each part's original materials safe and never
