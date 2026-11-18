@@ -2138,6 +2138,128 @@ namespace ReforgedRedux
             return g.ok && Vector3.Dot(p, g.wdir) >= g.cw && (!g.useH || Vector3.Dot(p, g.up) <= g.cwH);
         }
 
+        static readonly Dictionary<string, float[][]> exposureCache = new Dictionary<string, float[][]>();
+        static readonly HashSet<string> exposureLogged = new HashSet<string>();
+
+        // The prefab renderer matching a live one: same relative path, else the same mesh object (the name
+        // decides between copies, e.g. two doors sharing a mesh), else same name + same mesh shape.
+        Renderer PrefabTwin(Part prefab, Renderer r, Mesh m, Renderer[] pall, HashSet<Renderer> used)
+        {
+            Transform pt = prefab.transform.Find(RelPath(r.transform, part.transform));
+            Renderer pr = (pt != null) ? pt.GetComponent<Renderer>() : null;
+            if (pr != null && !used.Contains(pr) && SameShape(MeshOf(pr), m)) return pr;
+            Renderer sameMesh = null, sameName = null;
+            for (int i = 0; i < pall.Length; i++)
+            {
+                Renderer c = pall[i];
+                if (c == null || used.Contains(c)) continue;
+                Mesh cm = MeshOf(c);
+                bool same = object.ReferenceEquals(cm, m);
+                if (same && c.name == r.name) return c;
+                if (same && sameMesh == null) sameMesh = c;
+                if (!same && sameName == null && c.name == r.name && SameShape(cm, m)) sameName = c;
+            }
+            return (sameMesh != null) ? sameMesh : sameName;
+        }
+
+        static bool SameShape(Mesh a, Mesh b)
+        {
+            if (object.ReferenceEquals(a, b)) return true;
+            if (a == null || b == null || a.vertexCount != b.vertexCount || a.subMeshCount != b.subMeshCount) return false;
+            for (int s = 0; s < a.subMeshCount; s++) if (a.GetIndexCount(s) != b.GetIndexCount(s)) return false;
+            return true;
+        }
+
+        static string MatKey(Matrix4x4 m)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            for (int i = 0; i < 12; i++) sb.Append(Mathf.RoundToInt(m[i] * 1000f)).Append(',');
+            return sb.ToString();
+        }
+
+        // Per renderer in `live`, per triangle (submesh order): the fraction of the triangle that faces open
+        // space rather than the part's own interior. Measured on the part prefab's geometry when the prefab
+        // carries the same meshes (independent of door animations/TweakScale, shared by every copy of the part);
+        // procedural/runtime meshes fall back to the live geometry. null = unknown (count everything).
+        float[][] TileExposure(List<Renderer> live, List<Mesh> meshes)
+        {
+            Part prefab = (part.partInfo != null) ? part.partInfo.partPrefab : null;
+            string pname = (part.partInfo != null) ? part.partInfo.name : part.name;
+            // Each renderer is measured in the prefab's pose when its prefab twin is found (doors and other
+            // animated pieces as authored, so a bay opened in the editor still counts its inside as inside);
+            // renderers with no twin (created at runtime) keep their live pose. Both are part-local.
+            List<Matrix4x4> mats = new List<Matrix4x4>();
+            bool[] fromPrefab = new bool[live.Count];
+            int mapped = 0;
+            Renderer[] pall = (prefab != null) ? prefab.GetComponentsInChildren<Renderer>(true) : new Renderer[0];
+            HashSet<Renderer> used = new HashSet<Renderer>();
+            Matrix4x4 pw = (prefab != null) ? prefab.transform.worldToLocalMatrix : Matrix4x4.identity;
+            Matrix4x4 iw = part.transform.worldToLocalMatrix;
+            for (int i = 0; i < live.Count; i++)
+            {
+                Renderer pr = (prefab != null) ? PrefabTwin(prefab, live[i], meshes[i], pall, used) : null;
+                if (pr != null) { used.Add(pr); fromPrefab[i] = true; mapped++; mats.Add(pw * pr.transform.localToWorldMatrix); }
+                else mats.Add(iw * live[i].transform.localToWorldMatrix);
+            }
+            System.Text.StringBuilder kb = new System.Text.StringBuilder(pname);
+            for (int i = 0; i < live.Count; i++)
+            {
+                kb.Append('|').Append(RelPath(live[i].transform, part.transform)).Append('#').Append(meshes[i].GetInstanceID());
+                if (!fromPrefab[i]) kb.Append('@').Append(MatKey(mats[i]));
+            }
+            string key = kb.ToString();
+            float[][] res;
+            if (exposureCache.TryGetValue(key, out res)) return res;
+
+            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+            List<float> v = new List<float>();
+            List<int> tri = new List<int>();
+            int[] triStart = new int[live.Count + 1];
+            for (int i = 0; i < live.Count; i++)
+            {
+                triStart[i] = tri.Count / 3;
+                Mesh m = meshes[i];
+                Matrix4x4 mx = mats[i];
+                bool flip = mx.determinant < 0f;
+                int vb = v.Count / 3;
+                Vector3[] vs = m.vertices;
+                for (int k = 0; k < vs.Length; k++) { Vector3 p = mx.MultiplyPoint3x4(vs[k]); v.Add(p.x); v.Add(p.y); v.Add(p.z); }
+                for (int sub = 0; sub < m.subMeshCount; sub++)
+                {
+                    int[] st = m.GetTriangles(sub);
+                    for (int k = 0; k + 2 < st.Length; k += 3)
+                    {
+                        tri.Add(vb + st[k]);
+                        if (flip) { tri.Add(vb + st[k + 2]); tri.Add(vb + st[k + 1]); }
+                        else { tri.Add(vb + st[k + 1]); tri.Add(vb + st[k + 2]); }
+                    }
+                }
+            }
+            triStart[live.Count] = tri.Count / 3;
+            float[] e = null;
+            try { e = TileRays.Exposure(v.ToArray(), tri.ToArray()); }
+            catch (Exception ex) { Debug.LogWarning("[ReforgedRedux] heat tile exposure failed on " + pname + ": " + ex.Message); }
+            if (e != null)
+            {
+                res = new float[live.Count][];
+                for (int i = 0; i < live.Count; i++)
+                {
+                    res[i] = new float[triStart[i + 1] - triStart[i]];
+                    Array.Copy(e, triStart[i], res[i], 0, res[i].Length);
+                }
+            }
+            if (exposureCache.Count > 512) exposureCache.Clear();
+            exposureCache[key] = res;
+            if (exposureLogged.Add(pname))
+            {
+                float sum = 0f; if (e != null) for (int i = 0; i < e.Length; i++) sum += e[i];
+                Debug.Log("[ReforgedRedux] heat tile exposure " + pname + ": " + (tri.Count / 3) + " tris, "
+                    + (e != null ? (sum / Mathf.Max(1, e.Length)).ToString("0.00") + " avg exposed" : "skipped (too many triangles)")
+                    + ", " + (mapped == live.Count ? "prefab" : (mapped == 0 ? "live" : "mixed (" + mapped + "/" + live.Count + " prefab)")) + " geometry, " + sw.ElapsedMilliseconds + " ms");
+            }
+            return res;
+        }
+
         float TileArea(List<Zone> tz)
         {
             List<Renderer> rs = OwnRenderers();
@@ -2147,26 +2269,44 @@ namespace ReforgedRedux
             for (int i = 0; i < tz.Count; i++)
                 if (tz[i].region != null && (tz[i].region.StartsWith("g") || IsPlaneTok(tz[i].region))) geo.Add(ZoneGeoOf(tz[i].region, rs));
             zoneGeoCache.Clear();
-            float total = 0f;
+            // Only geometry that exists right now (inactive variant/switch meshes carry no tiles), and each
+            // triangle weighted by how much of it faces open space (interior walls weigh nothing).
+            List<Renderer> live = new List<Renderer>();
+            List<Mesh> liveMesh = new List<Mesh>();
             for (int i = 0; i < rs.Count; i++)
             {
                 Renderer r = rs[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
                 Mesh om;
                 Mesh m = (origMesh.TryGetValue(r, out om) && om != null) ? om : MeshOf(r);
                 if (m == null || !m.isReadable) continue;
+                live.Add(r); liveMesh.Add(m);
+            }
+            float[][] expo = TileExposure(live, liveMesh);
+            float total = 0f;
+            for (int i = 0; i < live.Count; i++)
+            {
+                Renderer r = live[i];
+                Mesh m = liveMesh[i];
+                float[] ex = (expo != null) ? expo[i] : null;
+                int triBase = 0;
                 Vector3[] vs = m.vertices;
                 Transform t = r.transform;
                 string rp = RelPath(r.transform, part.transform);
                 for (int sub = 0; sub < m.subMeshCount; sub++)
                 {
+                    int[] tri = m.GetTriangles(sub);
+                    int subBase = triBase;
+                    triBase += tri.Length / 3;
                     string pk = "pick|" + rp + "#" + sub;
                     bool all = whole || tz.Exists(delegate(Zone z) { return z.region == pk; });
                     if (!all && geo.Count == 0) continue;
-                    int[] tri = m.GetTriangles(sub);
                     for (int k = 0; k + 2 < tri.Length; k += 3)
                     {
                         Vector3 a = t.TransformPoint(vs[tri[k]]), b = t.TransformPoint(vs[tri[k + 1]]), c = t.TransformPoint(vs[tri[k + 2]]);
                         float area = Vector3.Cross(b - a, c - a).magnitude * 0.5f;
+                        int ti = subBase + k / 3;
+                        if (ex != null && ti < ex.Length) area *= ex[ti];
                         if (all) { total += area; continue; }
                         Vector3 cen = (a + b + c) / 3f;
                         for (int g = 0; g < geo.Count; g++)
@@ -5022,6 +5162,208 @@ namespace ReforgedRedux
             n.AddValue("r", pr.r);
             n.AddValue("g", pr.g);
             n.AddValue("b", pr.b);
+        }
+    }
+
+    // Heat-tile exposure: for each triangle, how much open sky it sees past the part's own geometry - a
+    // cosine-weighted share of 13 rays (the face normal + 6 tilted 35 deg + 6 tilted 65 deg) that leave without
+    // hitting another triangle. Outer skin ~1, the area beside a single wall ~0.6+, the bottom of a recess or
+    // an engine well ~0.4, the inside of service/cargo bays, hollow shells and doubled back-faces ~0, so tile
+    // weight only counts the surface that actually faces the airflow. Front faces follow Unity's winding:
+    // normal = (b - a) x (c - a).
+    internal static class TileRays
+    {
+        internal const int MaxTris = 150000;
+
+        internal static float[] Exposure(float[] v, int[] tri)
+        {
+            int T = tri.Length / 3;
+            if (T == 0 || T > MaxTris) return null;
+            float minx = float.MaxValue, miny = float.MaxValue, minz = float.MaxValue;
+            float maxx = float.MinValue, maxy = float.MinValue, maxz = float.MinValue;
+            for (int i = 0; i < tri.Length; i++)
+            {
+                int p = tri[i] * 3;
+                float x = v[p], y = v[p + 1], z = v[p + 2];
+                if (x < minx) minx = x; if (x > maxx) maxx = x;
+                if (y < miny) miny = y; if (y > maxy) maxy = y;
+                if (z < minz) minz = z; if (z > maxz) maxz = z;
+            }
+            float diag = (float)Math.Sqrt((maxx - minx) * (maxx - minx) + (maxy - miny) * (maxy - miny) + (maxz - minz) * (maxz - minz));
+            float[] res = new float[T];
+            if (!(diag > 1e-6f)) { for (int i = 0; i < T; i++) res[i] = 1f; return res; }
+            float pad = diag * 1e-3f;
+            minx -= pad; miny -= pad; minz -= pad; maxx += pad; maxy += pad; maxz += pad;
+            float dx = maxx - minx, dy = maxy - miny, dz = maxz - minz;
+
+            // uniform grid, ~2 cells per triangle, at most 64 per axis
+            double cells = Math.Min(Math.Max(2.0 * T, 8.0), 262144.0);
+            double minSide = diag * 0.02;
+            double vol = Math.Max(dx, minSide) * Math.Max(dy, minSide) * Math.Max(dz, minSide);
+            double cs = Math.Pow(vol / cells, 1.0 / 3.0);
+            int nx = Math.Max(1, Math.Min(64, (int)Math.Ceiling(dx / cs)));
+            int ny = Math.Max(1, Math.Min(64, (int)Math.Ceiling(dy / cs)));
+            int nz = Math.Max(1, Math.Min(64, (int)Math.Ceiling(dz / cs)));
+            float sx = dx / nx, sy = dy / ny, sz = dz / nz;
+
+            // per-triangle data: a, e1, e2
+            float[] td = new float[T * 9];
+            bool[] bad = new bool[T];
+            int[] lo = new int[T * 3], hi = new int[T * 3];
+            int[] cnt = new int[nx * ny * nz + 1];
+            for (int t = 0; t < T; t++)
+            {
+                int a = tri[3 * t] * 3, b = tri[3 * t + 1] * 3, c = tri[3 * t + 2] * 3;
+                float ax = v[a], ay = v[a + 1], az = v[a + 2];
+                td[9 * t] = ax; td[9 * t + 1] = ay; td[9 * t + 2] = az;
+                td[9 * t + 3] = v[b] - ax; td[9 * t + 4] = v[b + 1] - ay; td[9 * t + 5] = v[b + 2] - az;
+                td[9 * t + 6] = v[c] - ax; td[9 * t + 7] = v[c + 1] - ay; td[9 * t + 8] = v[c + 2] - az;
+                float tminx = Math.Min(ax, Math.Min(v[b], v[c])), tmaxx = Math.Max(ax, Math.Max(v[b], v[c]));
+                float tminy = Math.Min(ay, Math.Min(v[b + 1], v[c + 1])), tmaxy = Math.Max(ay, Math.Max(v[b + 1], v[c + 1]));
+                float tminz = Math.Min(az, Math.Min(v[b + 2], v[c + 2])), tmaxz = Math.Max(az, Math.Max(v[b + 2], v[c + 2]));
+                lo[3 * t] = Cell(tminx - pad, minx, sx, nx); hi[3 * t] = Cell(tmaxx + pad, minx, sx, nx);
+                lo[3 * t + 1] = Cell(tminy - pad, miny, sy, ny); hi[3 * t + 1] = Cell(tmaxy + pad, miny, sy, ny);
+                lo[3 * t + 2] = Cell(tminz - pad, minz, sz, nz); hi[3 * t + 2] = Cell(tmaxz + pad, minz, sz, nz);
+                for (int iz = lo[3 * t + 2]; iz <= hi[3 * t + 2]; iz++)
+                    for (int iy = lo[3 * t + 1]; iy <= hi[3 * t + 1]; iy++)
+                        for (int ix = lo[3 * t]; ix <= hi[3 * t]; ix++) cnt[ix + nx * (iy + ny * iz) + 1]++;
+            }
+            for (int i = 1; i < cnt.Length; i++) cnt[i] += cnt[i - 1];
+            int[] cellTris = new int[cnt[cnt.Length - 1]];
+            int[] fill = new int[nx * ny * nz];
+            for (int t = 0; t < T; t++)
+                for (int iz = lo[3 * t + 2]; iz <= hi[3 * t + 2]; iz++)
+                    for (int iy = lo[3 * t + 1]; iy <= hi[3 * t + 1]; iy++)
+                        for (int ix = lo[3 * t]; ix <= hi[3 * t]; ix++)
+                        {
+                            int ci = ix + nx * (iy + ny * iz);
+                            cellTris[cnt[ci] + fill[ci]++] = t;
+                        }
+
+            Grid g = new Grid();
+            g.td = td; g.start = cnt; g.cellTris = cellTris; g.stamp = new int[T];
+            g.nx = nx; g.ny = ny; g.nz = nz; g.minx = minx; g.miny = miny; g.minz = minz;
+            g.maxx = maxx; g.maxy = maxy; g.maxz = maxz; g.sx = sx; g.sy = sy; g.sz = sz;
+            g.eps = diag * 1e-4f;
+
+            // ray set in the triangle's tangent frame: (tangent-plane x, y, normal) + cosine weight
+            float[] rays = new float[13 * 4];
+            float wsum = 0f;
+            for (int k = 0; k < 13; k++)
+            {
+                double el = (k == 0) ? 0.0 : (k <= 6 ? 35.0 : 65.0) * Math.PI / 180.0;
+                double az = (k == 0) ? 0.0 : ((k <= 6 ? (k - 1) * 60.0 : (k - 7) * 60.0 + 30.0) * Math.PI / 180.0);
+                rays[4 * k] = (float)(Math.Sin(el) * Math.Cos(az));
+                rays[4 * k + 1] = (float)(Math.Sin(el) * Math.Sin(az));
+                rays[4 * k + 2] = (float)Math.Cos(el);
+                rays[4 * k + 3] = (float)Math.Cos(el);
+                wsum += rays[4 * k + 3];
+            }
+            float[] dir = new float[3];
+            for (int t = 0; t < T; t++)
+            {
+                float e1x = td[9 * t + 3], e1y = td[9 * t + 4], e1z = td[9 * t + 5];
+                float e2x = td[9 * t + 6], e2y = td[9 * t + 7], e2z = td[9 * t + 8];
+                float nX = e1y * e2z - e1z * e2y, nY = e1z * e2x - e1x * e2z, nZ = e1x * e2y - e1y * e2x;
+                float nl = (float)Math.Sqrt(nX * nX + nY * nY + nZ * nZ);
+                if (!(nl > 1e-12f)) { res[t] = 1f; continue; }
+                nX /= nl; nY /= nl; nZ /= nl;
+                // tangent frame
+                float t1x, t1y, t1z;
+                if (Math.Abs(nX) < 0.9f) { t1x = 0f; t1y = nZ; t1z = -nY; }      // n x (1,0,0)
+                else { t1x = -nZ; t1y = 0f; t1z = nX; }                            // n x (0,1,0)
+                float tl = (float)Math.Sqrt(t1x * t1x + t1y * t1y + t1z * t1z);
+                t1x /= tl; t1y /= tl; t1z /= tl;
+                float t2x = nY * t1z - nZ * t1y, t2y = nZ * t1x - nX * t1z, t2z = nX * t1y - nY * t1x;
+                float ox = td[9 * t] + (e1x + e2x) / 3f + nX * g.eps;
+                float oy = td[9 * t + 1] + (e1y + e2y) / 3f + nY * g.eps;
+                float oz = td[9 * t + 2] + (e1z + e2z) / 3f + nZ * g.eps;
+                float esc = 0f;
+                for (int k = 0; k < 13; k++)
+                {
+                    float a1 = rays[4 * k], a2 = rays[4 * k + 1], an = rays[4 * k + 2];
+                    dir[0] = a1 * t1x + a2 * t2x + an * nX;
+                    dir[1] = a1 * t1y + a2 * t2y + an * nY;
+                    dir[2] = a1 * t1z + a2 * t2z + an * nZ;
+                    if (!g.AnyHit(ox, oy, oz, dir[0], dir[1], dir[2], t)) esc += rays[4 * k + 3];
+                }
+                res[t] = esc / wsum;
+            }
+            return res;
+        }
+
+        static int Cell(float p, float min, float s, int n)
+        {
+            int i = (int)Math.Floor((p - min) / s);
+            return i < 0 ? 0 : (i >= n ? n - 1 : i);
+        }
+
+        sealed class Grid
+        {
+            public float[] td; public int[] start, cellTris, stamp; public int ray;
+            public int nx, ny, nz; public float minx, miny, minz, maxx, maxy, maxz, sx, sy, sz, eps;
+
+            public bool AnyHit(float ox, float oy, float oz, float dx, float dy, float dz, int self)
+            {
+                ray++;
+                float t0 = 0f, t1 = float.MaxValue;
+                if (!Slab(ox, dx, minx, maxx, ref t0, ref t1)) return false;
+                if (!Slab(oy, dy, miny, maxy, ref t0, ref t1)) return false;
+                if (!Slab(oz, dz, minz, maxz, ref t0, ref t1)) return false;
+                float px = ox + dx * t0, py = oy + dy * t0, pz = oz + dz * t0;
+                int ix = Cell(px, minx, sx, nx), iy = Cell(py, miny, sy, ny), iz = Cell(pz, minz, sz, nz);
+                int stx = dx > 0f ? 1 : (dx < 0f ? -1 : 0), sty = dy > 0f ? 1 : (dy < 0f ? -1 : 0), stz = dz > 0f ? 1 : (dz < 0f ? -1 : 0);
+                float tmx = stx == 0 ? float.MaxValue : (minx + (ix + (stx > 0 ? 1 : 0)) * sx - ox) / dx;
+                float tmy = sty == 0 ? float.MaxValue : (miny + (iy + (sty > 0 ? 1 : 0)) * sy - oy) / dy;
+                float tmz = stz == 0 ? float.MaxValue : (minz + (iz + (stz > 0 ? 1 : 0)) * sz - oz) / dz;
+                float tdx = stx == 0 ? float.MaxValue : sx / Math.Abs(dx);
+                float tdy = sty == 0 ? float.MaxValue : sy / Math.Abs(dy);
+                float tdz = stz == 0 ? float.MaxValue : sz / Math.Abs(dz);
+                while (true)
+                {
+                    int ci = ix + nx * (iy + ny * iz);
+                    for (int k = start[ci]; k < start[ci + 1]; k++)
+                    {
+                        int j = cellTris[k];
+                        if (j == self || stamp[j] == ray) continue;
+                        stamp[j] = ray;
+                        if (Hit(j, ox, oy, oz, dx, dy, dz)) return true;
+                    }
+                    if (tmx < tmy && tmx < tmz) { ix += stx; if (ix < 0 || ix >= nx) return false; tmx += tdx; }
+                    else if (tmy < tmz) { iy += sty; if (iy < 0 || iy >= ny) return false; tmy += tdy; }
+                    else { iz += stz; if (iz < 0 || iz >= nz) return false; tmz += tdz; }
+                }
+            }
+
+            static bool Slab(float o, float d, float mn, float mx, ref float t0, ref float t1)
+            {
+                if (Math.Abs(d) < 1e-12f) return o >= mn && o <= mx;
+                float a = (mn - o) / d, b = (mx - o) / d;
+                if (a > b) { float s = a; a = b; b = s; }
+                if (a > t0) t0 = a;
+                if (b < t1) t1 = b;
+                return t0 <= t1;
+            }
+
+            // Moller-Trumbore, two-sided, edges inclusive (rays must not leak through shared edges)
+            bool Hit(int j, float ox, float oy, float oz, float dx, float dy, float dz)
+            {
+                int b = 9 * j;
+                float e1x = td[b + 3], e1y = td[b + 4], e1z = td[b + 5];
+                float e2x = td[b + 6], e2y = td[b + 7], e2z = td[b + 8];
+                float px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
+                float det = e1x * px + e1y * py + e1z * pz;
+                if (Math.Abs(det) < 1e-14f) return false;
+                float inv = 1f / det;
+                float s0 = ox - td[b], s1 = oy - td[b + 1], s2 = oz - td[b + 2];
+                float u = (s0 * px + s1 * py + s2 * pz) * inv;
+                if (u < -1e-5f || u > 1.00001f) return false;
+                float qx = s1 * e1z - s2 * e1y, qy = s2 * e1x - s0 * e1z, qz = s0 * e1y - s1 * e1x;
+                float w = (dx * qx + dy * qy + dz * qz) * inv;
+                if (w < -1e-5f || u + w > 1.00001f) return false;
+                float t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+                return t > eps;
+            }
         }
     }
 
