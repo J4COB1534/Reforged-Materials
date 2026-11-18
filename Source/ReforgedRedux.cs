@@ -1053,6 +1053,24 @@ namespace ReforgedRedux
                 for (int i = 1; i + 1 < op.Count; i++) { drop.Add(op[0]); drop.Add(op[i]); drop.Add(op[i + 1]); }
             }
         }
+        // Moves the zone's share of `src` into `painted` (all of it when g is null = no slice, e.g. exterior
+        // of the whole part) and returns what is left.
+        static List<int> ZoneCut(List<Vector3> V, List<Vector3> N, List<Vector4> T, List<Vector2> U, List<BoneWeight> W,
+            Transform rt, ZoneGeo g, List<int> src, List<int> painted)
+        {
+            if (g == null) { painted.AddRange(src); return new List<int>(); }
+            List<int> keep = new List<int>(), drop = new List<int>();
+            ClipSoup(V, N, T, U, W, rt, g.wdir, g.cw, src, keep, drop);
+            if (g.useH)
+            {
+                List<int> k2 = new List<int>(), d2 = new List<int>();
+                ClipSoup(V, N, T, U, W, rt, -g.up, -g.cwH, keep, k2, d2);
+                painted.AddRange(k2); drop.AddRange(d2);
+            }
+            else painted.AddRange(keep);
+            return drop;
+        }
+
         static bool InRegionPt(Vector3 p, Vector3 wdir, float cw, Vector3 upDir, float cwHeight, bool useHeight)
         {
             return Vector3.Dot(p, wdir) >= cw && (!useHeight || Vector3.Dot(p, upDir) <= cwHeight);
@@ -1166,7 +1184,7 @@ namespace ReforgedRedux
             {
                 List<Zone> _ex = ParseZones(rdxZones); bool _fd = false;
                 if (_ex.Count == 0) { Vector3 _d; float _c, _f, _h; if (WeatherCache.RegionAxisDir(rdxRegion, out _d, out _c, out _f, out _h)) _fd = _f > 0.001f; else if (IsPlaneTok(rdxRegion)) _fd = PlaneFaded(rdxRegion); }
-                if (_ex.Count > 0 || _fd) { RebuildMulti(_ex); return; }
+                if (_ex.Count > 0 || _fd || IsExtTok(rdxRegion)) { RebuildMulti(_ex); return; }
             }
             List<Renderer> rs = OwnRenderers();
             bool autoFin = !rdxFinish && AutoStock(rdxColored, rdxColorMode);
@@ -1623,6 +1641,41 @@ namespace ReforgedRedux
 
         internal static bool IsPlaneTok(string t) { return t != null && t.StartsWith("pl|"); }
 
+        // "x|<region>" = the region, restricted to triangles that face open space (exposure >= ExteriorMin,
+        // see TileExposure): cargo/service bay interiors and deep recesses are left out.
+        internal const float ExteriorMin = 0.63f;
+        internal static bool IsExtTok(string t) { return t != null && t.StartsWith("x|"); }
+        internal static string ExtInner(string t) { return IsExtTok(t) ? t.Substring(2) : t; }
+        static bool Exposed(float[] ex, int tri) { return ex == null || tri >= ex.Length || ex[tri] >= ExteriorMin; }
+
+        internal Mesh SourceMesh(Renderer r) { Mesh om; return (origMesh.TryGetValue(r, out om) && om != null) ? om : MeshOf(r); }
+
+        // Active renderers with a readable source mesh (what the part shows right now) and, per renderer,
+        // the exposure of each triangle in submesh order. null = unknown (count everything as exterior).
+        float[][] LiveExposure(List<Renderer> rs, List<Renderer> live, List<Mesh> liveMesh)
+        {
+            for (int i = 0; i < rs.Count; i++)
+            {
+                Renderer r = rs[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                Mesh m = SourceMesh(r);
+                if (m == null || !m.isReadable) continue;
+                live.Add(r); liveMesh.Add(m);
+            }
+            return TileExposure(live, liveMesh);
+        }
+
+        internal Dictionary<Renderer, float[]> ExposureMap()
+        {
+            Dictionary<Renderer, float[]> d = new Dictionary<Renderer, float[]>();
+            if (part == null) return d;
+            List<Renderer> live = new List<Renderer>();
+            List<Mesh> lm = new List<Mesh>();
+            float[][] ex = LiveExposure(OwnRenderers(), live, lm);
+            if (ex != null) for (int i = 0; i < live.Count; i++) d[live[i]] = ex[i];
+            return d;
+        }
+
         static string F5(float f) { return f.ToString("0.#####", System.Globalization.CultureInfo.InvariantCulture); }
 
         internal static bool ParsePlane(string tok, out Vector3 n, out float d, out float fl, out bool useH, out Vector3 u, out float hd, out float hf)
@@ -1722,6 +1775,7 @@ namespace ReforgedRedux
         ZoneGeo ZoneGeoOf(string region, List<Renderer> rs)
         {
             ZoneGeo g;
+            region = ExtInner(region);
             if (zoneGeoCache.TryGetValue(region, out g)) return g;
             g = new ZoneGeo();
             g.up = part.transform.up;
@@ -1741,6 +1795,15 @@ namespace ReforgedRedux
             if (act.HasContent) { zones.RemoveAll(delegate(Zone zz) { return zz.region == act.region; }); zones.Add(act); }
             Zone whole = zones.Find(delegate(Zone z) { return z.region == "whole" || string.IsNullOrEmpty(z.region); });
             Zone baseZone = zones.Find(delegate(Zone z) { return z.region == "base"; });
+            bool anyExt = zones.Exists(delegate(Zone z) { return IsExtTok(z.region); });
+            Dictionary<Renderer, float[]> expo = null;
+            if (anyExt)
+            {
+                // Exterior-only zones: per-triangle exposure of every source mesh, measured before any split.
+                for (int i = 0; i < rs.Count; i++)
+                    if (rs[i] != null && !origMesh.ContainsKey(rs[i])) origMesh[rs[i]] = OriginalMesh(rs[i], MeshOf(rs[i]));
+                expo = ExposureMap();
+            }
 
             List<Material> prev = new List<Material>(created); created.Clear();
             for (int i = 0; i < rs.Count; i++)
@@ -1754,7 +1817,7 @@ namespace ReforgedRedux
                 bool canSplit = curMesh != null && src != null && src.isReadable && pris.Length > 0 && src.subMeshCount == pris.Length && SkinOk(r, src);
                 bool singleSub = canSplit && pris.Length == 1 && pris[0] != null;
 
-                List<Zone> geo = zones.FindAll(delegate(Zone z) { return z.region != null && (z.region.StartsWith("g") || IsPlaneTok(z.region)); });
+                List<Zone> geo = zones.FindAll(delegate(Zone z) { return z.region != null && (z.region.StartsWith("g") || IsPlaneTok(z.region) || IsExtTok(z.region)); });
                 List<Zone> pick = zones.FindAll(delegate(Zone z) { return z.region != null && z.region.StartsWith("pick|"); });
 
                 bool hasPickHere = false;
@@ -1772,7 +1835,7 @@ namespace ReforgedRedux
                         MeshToLists(src, out V, out N, out T, out U, out tris);
                         List<BoneWeight> W = SkinWeights(src, r);
 
-                        bool allFaded = singleSub && geo.Count > 0 && pick.Count == 0 && U != null && U.Count == V.Count;
+                        bool allFaded = singleSub && !anyExt && geo.Count > 0 && pick.Count == 0 && U != null && U.Count == V.Count;
                         for (int z = 0; z < geo.Count && allFaded; z++)
                         {
                             ZoneGeo zg = ZoneGeoOf(geo[z].region, rs);
@@ -1814,26 +1877,41 @@ namespace ReforgedRedux
                         List<List<int>> subTris = new List<List<int>>();
                         List<Material> subMats = new List<Material>();
                         geo.Reverse();
+                        float[] rex = null;
+                        if (anyExt && expo != null) expo.TryGetValue(r, out rex);
+                        int subBase = 0;
                         for (int j = 0; j < pris.Length; j++)
                         {
                             List<int> pool = (pris.Length == 1) ? tris : new List<int>(src.GetTriangles(j));
+                            int triBase = subBase;
+                            subBase += (int)src.GetIndexCount(j) / 3;
                             if (pris[j] == null) { if (pool.Count > 0) { subTris.Add(pool); subMats.Add(null); } continue; }
+                            // With exterior-only zones the pool is split up front (exposure is per original
+                            // triangle): poolX = outward-facing triangles, pool = the rest. Plain zones take from
+                            // both, exterior-only zones only from poolX.
+                            List<int> poolX = null;
+                            if (anyExt)
+                            {
+                                poolX = new List<int>(); List<int> inner = new List<int>();
+                                for (int t = 0; t + 2 < pool.Count; t += 3)
+                                {
+                                    List<int> dst = Exposed(rex, triBase + t / 3) ? poolX : inner;
+                                    dst.Add(pool[t]); dst.Add(pool[t + 1]); dst.Add(pool[t + 2]);
+                                }
+                                pool = inner;
+                            }
                             bool fadedHere = false;
                             for (int z = 0; z < geo.Count; z++)
                             {
-                                ZoneGeo zg = ZoneGeoOf(geo[z].region, rs);
-                                if (!zg.ok) continue;
-                                Vector3 wdir = zg.wdir, upDir = zg.up; float cw = zg.cw, cwH = zg.cwH, fadeAxisW = zg.faW, fadeHeightW = zg.fhW; bool useH = zg.useH;
-                                List<int> keep = new List<int>(), drop = new List<int>();
-                                ClipSoup(V, N, T, U, W, r.transform, wdir, cw, pool, keep, drop);
-                                List<int> painted = keep;
-                                if (useH)
-                                {
-                                    List<int> k2 = new List<int>(), d2 = new List<int>();
-                                    ClipSoup(V, N, T, U, W, r.transform, -upDir, -cwH, keep, k2, d2);
-                                    painted = k2; drop.AddRange(d2);
-                                }
-                                pool = drop;
+                                bool extZ = IsExtTok(geo[z].region);
+                                ZoneGeo zg = (ExtInner(geo[z].region) == "whole") ? null : ZoneGeoOf(geo[z].region, rs);
+                                if (zg != null && !zg.ok) continue;
+                                if (extZ && poolX == null) continue;
+                                Vector3 wdir = Vector3.up, upDir = Vector3.up; float cw = 0f, cwH = 0f, fadeAxisW = 0f, fadeHeightW = 0f; bool useH = false;
+                                if (zg != null) { wdir = zg.wdir; upDir = zg.up; cw = zg.cw; cwH = zg.cwH; fadeAxisW = zg.faW; fadeHeightW = zg.fhW; useH = zg.useH; }
+                                List<int> painted = new List<int>();
+                                if (poolX != null) poolX = ZoneCut(V, N, T, U, W, r.transform, zg, poolX, painted);
+                                if (!extZ) pool = ZoneCut(V, N, T, U, W, r.transform, zg, pool, painted);
                                 if (painted.Count == 0) continue;
                                 Zone mz = MergeBase(whole, geo[z]);
                                 if (fadeAxisW > 1e-4f && U != null && U.Count == V.Count)
@@ -1859,6 +1937,7 @@ namespace ReforgedRedux
                                 }
                                 else { subTris.Add(painted); subMats.Add(BuildZoneMaterial(pris[j], mz)); }
                             }
+                            if (poolX != null) pool.AddRange(poolX);
                             if (pool.Count > 0)
                             {
                                 Zone lz = (baseZone != null && baseZone.HasContent) ? MergeBase(whole, baseZone) : whole;
@@ -1907,7 +1986,20 @@ namespace ReforgedRedux
                 {
                     Zone gz = null;
                     for (int z = geo.Count - 1; z >= 0 && gz == null; z--)
-                        if (InZone(ZoneGeoOf(geo[z].region, rs), r.bounds.center)) gz = geo[z];
+                    {
+                        // Unsplittable renderer: all or nothing (exterior-only zones need it mostly outward-facing).
+                        bool inZ = ExtInner(geo[z].region) == "whole" || InZone(ZoneGeoOf(geo[z].region, rs), r.bounds.center);
+                        if (inZ && IsExtTok(geo[z].region) && expo != null)
+                        {
+                            float[] rx;
+                            if (expo.TryGetValue(r, out rx) && rx != null)
+                            {
+                                int outN = 0; for (int t = 0; t < rx.Length; t++) if (rx[t] >= ExteriorMin) outN++;
+                                inZ = outN * 2 >= rx.Length;
+                            }
+                        }
+                        if (inZ) gz = geo[z];
+                    }
                     Zone lz = (gz != null) ? MergeBase(whole, gz) : ((baseZone != null && baseZone.HasContent) ? MergeBase(whole, baseZone) : whole);
                     Material[] work = new Material[pris.Length];
                     for (int j = 0; j < pris.Length; j++)
@@ -2264,25 +2356,22 @@ namespace ReforgedRedux
         {
             List<Renderer> rs = OwnRenderers();
             bool whole = tz.Exists(delegate(Zone z) { return string.IsNullOrEmpty(z.region) || z.region == "whole" || z.region == "base"; });
+            bool wholeExt = tz.Exists(delegate(Zone z) { return z.region == "x|whole"; });
             List<ZoneGeo> geo = new List<ZoneGeo>();
+            List<bool> geoExt = new List<bool>();
             zoneGeoCache.Clear();
             for (int i = 0; i < tz.Count; i++)
-                if (tz[i].region != null && (tz[i].region.StartsWith("g") || IsPlaneTok(tz[i].region))) geo.Add(ZoneGeoOf(tz[i].region, rs));
+            {
+                string rg = ExtInner(tz[i].region);
+                if (rg != null && (rg.StartsWith("g") || IsPlaneTok(rg))) { geo.Add(ZoneGeoOf(rg, rs)); geoExt.Add(IsExtTok(tz[i].region)); }
+            }
             zoneGeoCache.Clear();
             // Only geometry that exists right now (inactive variant/switch meshes carry no tiles), and each
-            // triangle weighted by how much of it faces open space (interior walls weigh nothing).
+            // triangle weighted by how much of it faces open space (interior walls weigh nothing). Exterior-only
+            // zones carry tiles only on the triangles they actually paint (exposure >= ExteriorMin).
             List<Renderer> live = new List<Renderer>();
             List<Mesh> liveMesh = new List<Mesh>();
-            for (int i = 0; i < rs.Count; i++)
-            {
-                Renderer r = rs[i];
-                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
-                Mesh om;
-                Mesh m = (origMesh.TryGetValue(r, out om) && om != null) ? om : MeshOf(r);
-                if (m == null || !m.isReadable) continue;
-                live.Add(r); liveMesh.Add(m);
-            }
-            float[][] expo = TileExposure(live, liveMesh);
+            float[][] expo = LiveExposure(rs, live, liveMesh);
             float total = 0f;
             for (int i = 0; i < live.Count; i++)
             {
@@ -2300,7 +2389,7 @@ namespace ReforgedRedux
                     triBase += tri.Length / 3;
                     string pk = "pick|" + rp + "#" + sub;
                     bool all = whole || tz.Exists(delegate(Zone z) { return z.region == pk; });
-                    if (!all && geo.Count == 0) continue;
+                    if (!all && !wholeExt && geo.Count == 0) continue;
                     for (int k = 0; k + 2 < tri.Length; k += 3)
                     {
                         Vector3 a = t.TransformPoint(vs[tri[k]]), b = t.TransformPoint(vs[tri[k + 1]]), c = t.TransformPoint(vs[tri[k + 2]]);
@@ -2308,9 +2397,11 @@ namespace ReforgedRedux
                         int ti = subBase + k / 3;
                         if (ex != null && ti < ex.Length) area *= ex[ti];
                         if (all) { total += area; continue; }
+                        bool outward = Exposed(ex, ti);
+                        if (wholeExt && outward) { total += area; continue; }
                         Vector3 cen = (a + b + c) / 3f;
                         for (int g = 0; g < geo.Count; g++)
-                            if (InZone(geo[g], cen)) { total += area; break; }
+                            if ((!geoExt[g] || outward) && InZone(geo[g], cen)) { total += area; break; }
                     }
                 }
             }
@@ -2515,6 +2606,7 @@ namespace ReforgedRedux
         bool coversOpen;
         float regCut = 0.4f;
         bool regCraft;
+        static bool regExterior;
         float regHeight = 1f;
         float regFade = 0f;
         float regStrength = 1f;
@@ -3150,10 +3242,12 @@ namespace ReforgedRedux
             if (part == null || token == "whole") return;
             if (token == "pickscan") { BuildPickPreview(part, null); return; }
             if (token.StartsWith("pick|")) { BuildPickPreview(part, token.Substring(5)); return; }
-            if (IsCraftTok(token))
+            string xp = ModuleReforged.IsExtTok(token) ? "x|" : "";
+            string inner = ModuleReforged.ExtInner(token);
+            if (IsCraftTok(inner))
             {
                 List<Part> ps = GetParts();
-                for (int pi = 0; pi < ps.Count; pi++) if (ps[pi] != null) OverlayPart(ps[pi], PartPlace(ps[pi], token));
+                for (int pi = 0; pi < ps.Count; pi++) if (ps[pi] != null) OverlayPart(ps[pi], xp + PartPlace(ps[pi], inner));
                 return;
             }
             OverlayPart(part, token);
@@ -3163,8 +3257,15 @@ namespace ReforgedRedux
         {
             Transform mroot = part.transform.Find("model");
             Renderer[] rs = (mroot != null ? mroot : part.transform).GetComponentsInChildren<Renderer>(true);
-            Vector3 wdir, upDir; float cw, cwHeight, fadeW; bool useHeight;
-            if (ModuleReforged.IsPlaneTok(token))
+            Vector3 wdir = Vector3.up, upDir = Vector3.up; float cw = 0f, cwHeight = 0f, fadeW = 0f; bool useHeight = false;
+            // Exterior-only: preview only the outward-facing triangles (same exposure the module paints with).
+            bool ext = ModuleReforged.IsExtTok(token);
+            token = ModuleReforged.ExtInner(token);
+            bool slice = token != "whole";
+            ModuleReforged xmod = ext ? part.Modules.GetModule<ModuleReforged>() : null;
+            Dictionary<Renderer, float[]> xexp = (xmod != null) ? xmod.ExposureMap() : null;
+            if (!slice) { }
+            else if (ModuleReforged.IsPlaneTok(token))
             {
                 float fhw;
                 if (!ModuleReforged.PlaneWorld(part.transform, token, out wdir, out cw, out fadeW, out upDir, out cwHeight, out useHeight, out fhw)) return;
@@ -3202,14 +3303,27 @@ namespace ReforgedRedux
                 if (rs[i] == null || ModuleReforged.SkipRenderer(rs[i]) || !rs[i].enabled || !rs[i].gameObject.activeInHierarchy) continue;
                 Part owner = rs[i].GetComponentInParent<Part>();
                 if (owner != null && owner != part) continue;
-                Mesh mfm = ModuleReforged.MeshOf(rs[i]);
+                Mesh mfm = (xmod != null) ? xmod.SourceMesh(rs[i]) : ModuleReforged.MeshOf(rs[i]);
                 if (mfm == null || !mfm.isReadable) continue;
                 List<Vector3> V, N; List<Vector4> T; List<Vector2> U; List<int> tris;
                 ModuleReforged.MeshToLists(mfm, out V, out N, out T, out U, out tris);
+                if (ext)
+                {
+                    float[] rx = null;
+                    if (xexp != null) xexp.TryGetValue(rs[i], out rx);
+                    if (rx != null)
+                    {
+                        List<int> outT = new List<int>();
+                        for (int t = 0; t + 2 < tris.Count; t += 3)
+                            if (t / 3 >= rx.Length || rx[t / 3] >= ModuleReforged.ExteriorMin) { outT.Add(tris[t]); outT.Add(tris[t + 1]); outT.Add(tris[t + 2]); }
+                        tris = outT;
+                    }
+                }
                 List<int> keep1 = new List<int>(), drop1 = new List<int>();
-                ModuleReforged.ClipSoup(V, N, T, U, rs[i].transform, wdir, cw, tris, keep1, drop1);
+                if (slice) ModuleReforged.ClipSoup(V, N, T, U, rs[i].transform, wdir, cw, tris, keep1, drop1);
+                else keep1 = tris;
                 List<int> region = keep1;
-                if (useHeight)
+                if (slice && useHeight)
                 {
                     List<int> keep2 = new List<int>(), d2 = new List<int>();
                     ModuleReforged.ClipSoup(V, N, T, U, rs[i].transform, -upDir, -cwHeight, keep1, keep2, d2);
@@ -3387,10 +3501,10 @@ namespace ReforgedRedux
             Part pv; string tok;
             if (pickId != null && pickPart != null) { pv = pickPart; tok = "pick|" + pickId; }
             else if (meshPick) { pv = (ovLocked != null) ? ovLocked : lastHovered; tok = "pickscan"; }
-            else { pv = (ovLocked != null) ? ovLocked : lastHovered; tok = CurRegion(); }
-            bool craftOv = IsCraftTok(tok) && pickId == null && !meshPick;
+            else { pv = (ovLocked != null) ? ovLocked : lastHovered; tok = Ext(CurRegion()); }
+            bool craftOv = IsCraftTok(ModuleReforged.ExtInner(tok)) && pickId == null && !meshPick;
             if (craftOv) pv = CraftAnchor();
-            bool want = show && showOverlay && pv != null && (pickId != null || meshPick || !regWhole);
+            bool want = show && showOverlay && pv != null && (pickId != null || meshPick || !regWhole || ModuleReforged.IsExtTok(tok));
             if (!want) { if (ovPart != null) ClearOverlay(); return; }
             if (pv != ovPart || tok != ovToken) overlayApplied = false;
             bool stale = pv != ovPart || tok != ovToken || regStrength != ovStr || overlayApplied != ovApplied;
@@ -3452,7 +3566,7 @@ namespace ReforgedRedux
                 mod.rdxKeepShiny = uiKeepShiny;
                 if (brushColors) mod.rdxPaintDetail = WeatherCache.PaintDetail;
                 if (brushTextures) mod.rdxTexDetail = WeatherCache.TexSkipDetail;
-                bool wholeFilter = regWhole && pickId == null && !meshPick && mod.Active;
+                bool wholeFilter = regWhole && pickId == null && !meshPick && mod.Active && !regExterior;
                 if (wholeFilter && regShineSpot == 0)
                 {
                     bool did = true;
@@ -3467,7 +3581,7 @@ namespace ReforgedRedux
                     if (did) { n++; continue; }
                 }
                 if (brushKind != 4 && brushKind != 6 && brushKind != 8)
-                    mod.SetRegion(wholeFilter ? (regShineSpot == 1 ? "base" : "whole") : PartPlace(parts[i], CurRegion()));
+                    mod.SetRegion(wholeFilter ? (regShineSpot == 1 ? "base" : "whole") : Ext(PartPlace(parts[i], CurRegion())));
                 mod.rdxShineSpot = (pickId != null && !brForceNew) ? regShineSpot : 0;
                 switch (brushKind)
                 {
@@ -3482,7 +3596,7 @@ namespace ReforgedRedux
                         n++;
                         break;
                     case 3:
-                        mod.AddWeather(brLevel, brTex, PartPlace(parts[i], brPlace), brScale);
+                        mod.AddWeather(brLevel, brTex, Ext(PartPlace(parts[i], brPlace)), brScale);
                         n++;
                         break;
                     case 4:
@@ -3492,13 +3606,13 @@ namespace ReforgedRedux
                     case 5:
                         if (brCombo != null && !string.IsNullOrEmpty(brCombo.recipe))
                         {
-                            mod.ApplyComboLayers(PartPlace(parts[i], CurRegion()), StrengthCode(), brCombo.recipe.Split(';'),
+                            mod.ApplyComboLayers(Ext(PartPlace(parts[i], CurRegion())), StrengthCode(), brCombo.recipe.Split(';'),
                                 brCombo.hasColor, new Color(brCombo.r, brCombo.g, brCombo.b),
                                 brCombo.hasFinish, brCombo.metal, brCombo.smooth, regPatScale);
                         }
                         else
                         {
-                            mod.AppendStack(IsCraftTok(CurRegion()) ? ModuleReforged.PlaceStack(brComboStack, PartPlace(parts[i], CurRegion())) : brComboStack);
+                            mod.AppendStack(IsCraftTok(CurRegion()) || regExterior ? ModuleReforged.PlaceStack(brComboStack, Ext(PartPlace(parts[i], CurRegion()))) : brComboStack);
                             if (brCombo != null)
                             {
                                 if (brCombo.hasFinish && brCombo.hasColor)
@@ -3666,6 +3780,14 @@ namespace ReforgedRedux
             Arm(5, Loc.T("#RDX_LblCombo", "Combo: <<1>>", c.name) + (regWhole ? "" : " / " + Loc.T("#RDX_LblRegion", "region")));
         }
 
+        // "Paint exterior only": wraps a region token as "x|<region>" (everything but "base" and picks).
+        string Ext(string tok)
+        {
+            if (!regExterior || pickId != null || meshPick || string.IsNullOrEmpty(tok)) return tok;
+            if (tok == "base" || tok.StartsWith("pick") || ModuleReforged.IsExtTok(tok)) return tok;
+            return "x|" + tok;
+        }
+
         string CurRegion()
         {
             if (pickId != null) return "pick|" + pickId;
@@ -3792,6 +3914,12 @@ namespace ReforgedRedux
                 ch = true;
             }
             if (nmode != 2 && (pickId != null || meshPick)) { pickId = null; pickPart = null; meshPick = false; ch = true; }
+            if (nmode != 2)
+            {
+                bool nx = GUILayout.Toggle(regExterior, "<b>" + Loc.T("#RDX_ExteriorOnly", "Paint exterior only") + "</b>", toggleBold);
+                if (nx != regExterior) { regExterior = nx; ch = true; SavePresets(); }
+                Hint(Loc.T("#RDX_HintExterior", "Only surfaces facing out get the paint: bay\ninteriors and deep recesses keep their look."));
+            }
             if (nmode == 1)
             {
                 int nc0 = GUILayout.Toolbar(regCraft ? 1 : 0, new string[] { Loc.T("#RDX_RegEachPart", "Each part"), Loc.T("#RDX_RegWholeCraft", "Whole craft") });
@@ -5045,6 +5173,7 @@ namespace ReforgedRedux
                 { string lv = root.GetValue("lowVram"); if (lv != null) WeatherCache.LowVram = lv == "True"; }
                 { int cl; if (int.TryParse(root.GetValue("cacheLimitMB"), out cl) && Array.IndexOf(CacheLimits, cl) >= 0) WeatherCache.CacheLimitMB = cl; }
                 { string sy = root.GetValue("symPaint"); if (sy != null) paintSym = sy != "False"; }
+                { string rx = root.GetValue("regionExterior"); if (rx != null) regExterior = rx == "True"; }
                 ModuleReforged.IgnoredParts.Clear();
                 ConfigNode[] igs = root.GetNodes("REDUX_IGNORE");
                 for (int i = 0; i < igs.Length; i++)
@@ -5142,6 +5271,7 @@ namespace ReforgedRedux
                 root.AddValue("lowVram", WeatherCache.LowVram);
                 root.AddValue("cacheLimitMB", WeatherCache.CacheLimitMB);
                 root.AddValue("symPaint", paintSym);
+                root.AddValue("regionExterior", regExterior);
                 foreach (string ipn in ModuleReforged.IgnoredParts) root.AddNode("REDUX_IGNORE").AddValue("name", ipn);
                 for (int bi = 0; bi < binds.Length; bi++) root.AddValue("key_" + binds[bi].id, BindSave(binds[bi]));
                 string path = PresetsPath();
@@ -5754,6 +5884,8 @@ namespace ReforgedRedux
         internal static float[] GetMask(Part part, string place)
         {
             if (part == null) return null;
+            // Exterior-only places mask like their inner region; the exterior cut itself is geometric (RebuildMulti).
+            if (ModuleReforged.IsExtTok(place)) { place = ModuleReforged.ExtInner(place); if (place == "whole") return null; }
             string pname = (part.partInfo != null) ? part.partInfo.name : part.name;
             List<Renderer> rs = PartRenderers(part);
 
