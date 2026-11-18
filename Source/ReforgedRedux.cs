@@ -1193,6 +1193,9 @@ namespace ReforgedRedux
                 Vector3 ldir; float lcut, lfade, lheight;
                 if (WeatherCache.RegionAxisDir(regionPlace, out ldir, out lcut, out lfade, out lheight))
                 {
+                    Quaternion tq = WeatherCache.TiltLocal(regionPlace, ldir, rs, part, part.transform);
+                    ldir = tq * ldir;
+                    upDir = part.transform.TransformDirection(tq * Vector3.up).normalized;
                     float rlo, rhi;
                     wdir = part.transform.TransformDirection(ldir).normalized;
                     RegionExtent(rs, wdir, out rlo, out rhi);
@@ -1700,6 +1703,9 @@ namespace ReforgedRedux
             }
             Vector3 ldir; float lcut, lfade, lheight;
             if (!WeatherCache.RegionAxisDir(region, out ldir, out lcut, out lfade, out lheight)) return false;
+            Quaternion tq = WeatherCache.TiltLocal(region, ldir, rs, part, part.transform);
+            ldir = tq * ldir;
+            upDir = part.transform.TransformDirection(tq * part.transform.InverseTransformDirection(upDir)).normalized;
             float rlo, rhi;
             wdir = part.transform.TransformDirection(ldir).normalized;
             RegionExtent(rs, wdir, out rlo, out rhi);
@@ -2380,7 +2386,8 @@ namespace ReforgedRedux
         float regStrength = 1f;
         float regPatScale = 1f;
         string dirtSearch = "";
-        string regCutBuf, regHeightBuf, regFadeBuf, regStrBuf, regScaleBuf;
+        string regCutBuf, regHeightBuf, regFadeBuf, regStrBuf, regScaleBuf, regRotBuf, regRot2Buf;
+        float regRot, regRot2;
         int heatVariant;
         bool showOverlay = true;
         static bool showHints = true;
@@ -3033,8 +3040,10 @@ namespace ReforgedRedux
             {
                 Vector3 ldir; float lcut, lfade, lheight;
                 if (!WeatherCache.RegionAxisDir(token, out ldir, out lcut, out lfade, out lheight)) return;
+                Quaternion tq = WeatherCache.TiltLocal(token, ldir, rs, part, part.transform);
+                ldir = tq * ldir;
                 wdir = part.transform.TransformDirection(ldir).normalized;
-                upDir = part.transform.up;
+                upDir = part.transform.TransformDirection(tq * Vector3.up).normalized;
                 float lo = float.MaxValue, hi = float.MinValue, vlo = float.MaxValue, vhi = float.MinValue;
                 for (int i = 0; i < rs.Length; i++)
                 {
@@ -3538,10 +3547,36 @@ namespace ReforgedRedux
             int c = Mathf.Clamp(Mathf.RoundToInt(regCut * 100f), 0, 100);
             int f = Mathf.Clamp(Mathf.RoundToInt(regFade * 100f), 0, 100);
             int h = Mathf.Clamp(Mathf.RoundToInt(regHeight * 100f), 0, 100);
-            return (regCraft ? "c" : "g") + regAxis + "_" + c.ToString("00") + "_" + f.ToString("00") + "_" + h.ToString("00");
+            int rt = Mathf.Clamp(Mathf.RoundToInt(regRot), -180, 180);
+            int rt2 = Mathf.Clamp(Mathf.RoundToInt(regRot2), -180, 180);
+            return (regCraft ? "c" : "g") + regAxis + "_" + c.ToString("00") + "_" + f.ToString("00") + "_" + h.ToString("00")
+                + (rt != 0 || rt2 != 0 ? "_" + rt : "") + (rt2 != 0 ? "_" + rt2 : "");
         }
 
         static bool IsCraftTok(string t) { return t != null && t.Length > 1 && t[0] == 'c' && char.IsDigit(t[1]); }
+
+        // Craft frame: editor world axes in the VAB/SPH, the root part's axes in flight (the "Whole craft"
+        // region's convention); 'lup' = the local height axis (turned with the region's rotation).
+        bool CraftFrame(Vector3 ldir, Vector3 lup, out Vector3 wdir, out Vector3 up)
+        {
+            wdir = ldir.normalized; up = lup.normalized;
+            if (HighLogic.LoadedSceneIsEditor) return true;
+            Part root = CraftAnchor();
+            if (root == null) return false;
+            wdir = root.transform.TransformDirection(ldir).normalized; up = root.transform.TransformDirection(lup).normalized;
+            return true;
+        }
+
+        // World directions of the craft frame's X/Y/Z axes (see CraftFrame).
+        bool CraftAxes(out Vector3 ax, out Vector3 ay, out Vector3 az)
+        {
+            ax = Vector3.right; ay = Vector3.up; az = Vector3.forward;
+            if (HighLogic.LoadedSceneIsEditor) return true;
+            Part root = CraftAnchor();
+            if (root == null) return false;
+            ax = root.transform.right; ay = root.transform.up; az = root.transform.forward;
+            return true;
+        }
 
         Part CraftAnchor()
         {
@@ -3588,13 +3623,16 @@ namespace ReforgedRedux
             if (!WeatherCache.RegionAxisDir("g" + tok.Substring(1), out ldir, out lcut, out lfade, out lheight)) return false;
             List<Part> ps = GetParts();
             if (ps.Count == 0) return false;
-            if (HighLogic.LoadedSceneIsEditor) { ccW = ldir.normalized; ccU = Vector3.up; }
-            else
+            string gtok = "g" + tok.Substring(1);
+            Vector3 fx, fy, fz, lup = Vector3.up;
+            if (WeatherCache.HasTilt(gtok) && CraftAxes(out fx, out fy, out fz))
             {
-                Part root = CraftAnchor();
-                if (root == null) return false;
-                ccW = root.transform.TransformDirection(ldir).normalized; ccU = root.transform.up;
+                List<Renderer> all = new List<Renderer>();
+                for (int i = 0; i < ps.Count; i++) if (ps[i] != null) all.AddRange(WeatherCache.PartRenderers(ps[i]));
+                Quaternion tq = WeatherCache.TiltQuat(ldir, WeatherCache.RegionTilt(gtok), WeatherCache.RegionTilt2(gtok), WeatherCache.AxesSize(all, null, fx, fy, fz));
+                ldir = tq * ldir; lup = tq * Vector3.up;
             }
+            if (!CraftFrame(ldir, lup, out ccW, out ccU)) return false;
             float lo = float.MaxValue, hi = float.MinValue, vlo = float.MaxValue, vhi = float.MinValue;
             for (int i = 0; i < ps.Count; i++) if (ps[i] != null) CraftExtentPart(ps[i], ref lo, ref hi, ref vlo, ref vhi);
             if (hi - lo < 1e-4f) return false;
@@ -3647,7 +3685,7 @@ namespace ReforgedRedux
                 pickId = null; pickPart = null; meshPick = false;
                 regShineSpot = (nmode == 0) ? 2 : 0;
                 regWhole = (nmode != 1);
-                if (nmode == 1) { regCut = 0.4f; regHeight = 1f; regFade = 0f; regCutBuf = null; regHeightBuf = null; regFadeBuf = null; if (mode == 0) mode = 1; }
+                if (nmode == 1) { regCut = 0.4f; regHeight = 1f; regFade = 0f; regRot = 0f; regRot2 = 0f; regCutBuf = null; regHeightBuf = null; regFadeBuf = null; regRotBuf = null; regRot2Buf = null; if (mode == 0) mode = 1; }
                 else if (nmode == 2) meshPick = true;
                 ch = true;
             }
@@ -3665,6 +3703,11 @@ namespace ReforgedRedux
                 if (nh != regHeight) { regHeight = nh; ch = true; }
                 float nf = SliderNum(Loc.T("#RDX_Fade", "Fade"), regFade, 0f, 1f, ref regFadeBuf);
                 if (nf != regFade) { regFade = nf; ch = true; }
+                float nr = RotSlider(Loc.T("#RDX_Rotation", "Rotation"), regRot, ref regRotBuf);
+                if (nr != regRot) { regRot = nr; ch = true; }
+                float nr2 = RotSlider(Loc.T("#RDX_Rotation2", "Rotation 2"), regRot2, ref regRot2Buf);
+                if (nr2 != regRot2) { regRot2 = nr2; ch = true; }
+                Hint(Loc.T("#RDX_HintRotation", "Rotation turns the region edges across the face,\nRotation 2 tips them the other way (Top: forward/back\nand left/right). 5° steps, Shift for 1°."));
             }
             else if (nmode == 2)
             {
@@ -3927,6 +3970,25 @@ namespace ReforgedRedux
             GUI.color = c;
             GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill);
             GUI.color = old;
+        }
+
+        // -180..180 degrees; the slider snaps to 5 degree steps, or 1 degree while Shift is held.
+        float RotSlider(string label, float val, ref string buf)
+        {
+            if (buf == null) buf = Mathf.RoundToInt(val).ToString();
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, builderLabel, GUILayout.Width(76f));
+            float sv = GUILayout.HorizontalSlider(val, -180f, 180f, GUILayout.Width(118f), GUILayout.Height(20f));
+            if (sv != val)
+            {
+                float step = (Event.current.shift || Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift)) ? 1f : 5f;
+                sv = Mathf.Clamp(Mathf.Round(sv / step) * step, -180f, 180f);
+                buf = Mathf.RoundToInt(sv).ToString();
+            }
+            buf = GUILayout.TextField(buf, GUILayout.Width(48f));
+            GUILayout.EndHorizontal();
+            int tv;
+            return int.TryParse(buf, out tv) ? Mathf.Clamp(tv, -180, 180) : sv;
         }
 
         float SliderNum(string label, float val, float min, float max, ref string buf)
@@ -5277,7 +5339,7 @@ namespace ReforgedRedux
             return t * t * (3f - 2f * t);
         }
 
-        static List<Renderer> PartRenderers(Part part)
+        internal static List<Renderer> PartRenderers(Part part)
         {
             List<Renderer> mine = new List<Renderer>();
             if (part == null) return mine;
@@ -5409,6 +5471,72 @@ namespace ReforgedRedux
             return false;
         }
 
+        // Optional 5th / 6th region-token fields: Rotation and Rotation 2 of the region in degrees, -180..180
+        // (applied by TiltQuat; the 5th is written as 0 when only the 6th is set).
+        internal static float RegionTilt(string tok) { return TokenRot(tok, 4); }
+        internal static float RegionTilt2(string tok) { return TokenRot(tok, 5); }
+        internal static bool HasTilt(string tok) { return Mathf.Abs(RegionTilt(tok)) > 0.01f || Mathf.Abs(RegionTilt2(tok)) > 0.01f; }
+        static float TokenRot(string tok, int field)
+        {
+            if (string.IsNullOrEmpty(tok) || tok[0] != 'g') return 0f;
+            string[] f = tok.Substring(1).Split('_');
+            int rot;
+            return (f.Length > field && int.TryParse(f[field], out rot)) ? rot % 360 : 0f;
+        }
+
+        // The tilt as one rotation of the whole region frame (cut direction AND height axis), so the Cutoff
+        // and Height edges turn together, like turning the frame's forward axis while looking at the face the
+        // region is on. It turns about the normal of the face the cut runs across: of the two frame axes
+        // perpendicular to the cut direction 'dir' (frame-local, one of the six axes), the one the geometry is
+        // thinnest along ('size' = extents along the frame axes; on a wing that is its thickness). Round
+        // cross-sections (within 15%) spin side cuts around the vertical axis and tip Top/Btm toward the front.
+        // 'deg2' (Rotation 2) turns about the remaining perpendicular axis, taken in the frame already turned
+        // by 'deg': on a round body Top/Btm then tip left/right as well as forward/back.
+        internal static Quaternion TiltQuat(Vector3 dir, float deg, float deg2, Vector3 size)
+        {
+            if (Mathf.Abs(deg) < 0.01f && Mathf.Abs(deg2) < 0.01f) return Quaternion.identity;
+            int a = (Mathf.Abs(dir.x) > 0.5f) ? 0 : (Mathf.Abs(dir.y) > 0.5f ? 1 : 2);
+            int pa = (a == 0) ? 1 : 0, qa = (a == 2) ? 1 : 2;
+            float sp = size[pa], sq = size[qa];
+            int axis = (Mathf.Abs(sp - sq) <= 0.15f * Mathf.Max(sp, sq)) ? ((a == 1) ? 0 : 1) : (sp < sq ? pa : qa);
+            int axis2 = (axis == pa) ? qa : pa;
+            return Quaternion.AngleAxis(deg, FrameAxis(axis)) * Quaternion.AngleAxis(deg2, FrameAxis(axis2));
+        }
+        static Vector3 FrameAxis(int i) { return (i == 0) ? Vector3.right : ((i == 1) ? Vector3.up : Vector3.forward); }
+
+        // Extents of the renderers' mesh bounds along three world axes (owner != null: only that part's own).
+        internal static Vector3 AxesSize(IList<Renderer> rs, Part owner, Vector3 ax, Vector3 ay, Vector3 az)
+        {
+            Vector3 lo = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue), hi = -lo;
+            bool any = false;
+            for (int i = 0; i < rs.Count; i++)
+            {
+                Renderer r = rs[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                if (owner != null) { Part o = r.GetComponentInParent<Part>(); if (o != null && o != owner) continue; }
+                Mesh m = ModuleReforged.MeshOf(r);
+                if (m == null) continue;
+                Bounds b = m.bounds;
+                for (int c = 0; c < 8; c++)
+                {
+                    Vector3 lp = new Vector3((c & 1) == 0 ? b.min.x : b.max.x, (c & 2) == 0 ? b.min.y : b.max.y, (c & 4) == 0 ? b.min.z : b.max.z);
+                    Vector3 w = r.transform.TransformPoint(lp);
+                    Vector3 pr = new Vector3(Vector3.Dot(w, ax), Vector3.Dot(w, ay), Vector3.Dot(w, az));
+                    lo = Vector3.Min(lo, pr); hi = Vector3.Max(hi, pr);
+                    any = true;
+                }
+            }
+            return any ? hi - lo : Vector3.one;
+        }
+
+        // The token's tilt rotation in the local frame of 'frame' (a part transform); apply it to RegionAxisDir's
+        // direction and to the local up (height) axis.
+        internal static Quaternion TiltLocal(string tok, Vector3 ldir, IList<Renderer> rs, Part owner, Transform frame)
+        {
+            if (!HasTilt(tok) || frame == null) return Quaternion.identity;
+            return TiltQuat(ldir, RegionTilt(tok), RegionTilt2(tok), AxesSize(rs, owner, frame.right, frame.up, frame.forward));
+        }
+
         internal static float[] GetMask(Part part, string place)
         {
             if (part == null) return null;
@@ -5430,7 +5558,9 @@ namespace ReforgedRedux
             {
                 float rcut, rfade, rheight;
                 Vector3 dir;
+                Vector3 upL = Vector3.up;
                 if (!RegionAxisDir(place, out dir, out rcut, out rfade, out rheight)) { dir = Vector3.up; rcut = 0.4f; }
+                else { Quaternion tq = TiltLocal(place, dir, rs, part, part.transform); dir = tq * dir; upL = tq * Vector3.up; }
                 Vector3 qn, qu; float qd, qfl, qhd, qhf; bool quH;
                 bool qPlane = ModuleReforged.ParsePlane(place, out qn, out qd, out qfl, out quH, out qu, out qhd, out qhf);
                 float lo = float.MaxValue, hi = float.MinValue;
@@ -5448,8 +5578,9 @@ namespace ReforgedRedux
                         float c = Vector3.Dot(pl, dir);
                         if (c < lo) lo = c;
                         if (c > hi) hi = c;
-                        if (pl.y < vlo) vlo = pl.y;
-                        if (pl.y > vhi) vhi = pl.y;
+                        float py = Vector3.Dot(pl, upL);
+                        if (py < vlo) vlo = py;
+                        if (py > vhi) vhi = py;
                     }
                     meshes.Add(mesh); trs.Add(rs[i].transform);
                 }
@@ -5482,7 +5613,7 @@ namespace ReforgedRedux
                         float w = Smooth(rcut, rcut + bandC, cA);
                         if (useH)
                         {
-                            float hN = (pl.y - vlo) / (vhi - vlo);
+                            float hN = (Vector3.Dot(pl, upL) - vlo) / (vhi - vlo);
                             w *= 1f - Smooth(rheight - bandH, rheight, hN);
                         }
                         wv[v] = w;
