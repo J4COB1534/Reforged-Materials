@@ -1716,6 +1716,32 @@ namespace ReforgedRedux
             return true;
         }
 
+        // Same slice as a "g" region (cutoff/fade/height measured over this part's own geometry), but along
+        // an arbitrary world direction; returned as a part-local plane token so it survives save/load.
+        internal string AxisPlaneToken(Vector3 wdir, Vector3 upW, float lcut, float lfade, float lheight)
+        {
+            if (part == null) return null;
+            List<Renderer> rs = OwnRenderers();
+            float lo, hi;
+            RegionExtent(rs, wdir, out lo, out hi);
+            if (hi - lo < 1e-5f) return null;
+            float cw = lo + lcut * (hi - lo);
+            float fw = lfade * Mathf.Max(1e-4f, hi - cw);
+            bool useH = false; float cwH = 0f, fhW = 0f;
+            if (lheight < 0.999f)
+            {
+                float vlo, vhi;
+                RegionExtent(rs, upW, out vlo, out vhi);
+                if (vhi - vlo > 1e-5f)
+                {
+                    useH = true;
+                    cwH = vlo + lheight * (vhi - vlo);
+                    fhW = lfade * Mathf.Max(1e-4f, cwH - vlo);
+                }
+            }
+            return PlaneToken(part.transform, wdir, cw, fw, useH, upW, cwH, fhW);
+        }
+
         class ZoneGeo { public bool ok, useH; public Vector3 wdir, up; public float cw, cwH, faW, fhW; }
         readonly Dictionary<string, ZoneGeo> zoneGeoCache = new Dictionary<string, ZoneGeo>();
 
@@ -2375,6 +2401,7 @@ namespace ReforgedRedux
         bool coversOpen;
         float regCut = 0.4f;
         bool regCraft;
+        static bool regEditor;
         float regHeight = 1f;
         float regFade = 0f;
         float regStrength = 1f;
@@ -2974,7 +3001,7 @@ namespace ReforgedRedux
         readonly List<Mesh> ovMeshes = new List<Mesh>();
         readonly List<Transform> ovTrs = new List<Transform>();
         Part ovPart, ovLocked; string ovToken = "~"; float ovStr = -1f;
-        float ovBuiltAt; int ovCount = -1;
+        float ovBuiltAt; int ovCount = -1; Quaternion ovRot = Quaternion.identity;
 
         static Material RegOverlayMat()
         {
@@ -3016,6 +3043,7 @@ namespace ReforgedRedux
                 for (int pi = 0; pi < ps.Count; pi++) if (ps[pi] != null) OverlayPart(ps[pi], PartPlace(ps[pi], token));
                 return;
             }
+            if (IsEditorTok(token)) { ovRot = part.transform.rotation; OverlayPart(part, PartPlace(part, token)); return; }
             OverlayPart(part, token);
         }
 
@@ -3255,6 +3283,7 @@ namespace ReforgedRedux
             if (pv != ovPart || tok != ovToken) overlayApplied = false;
             bool stale = pv != ovPart || tok != ovToken || regStrength != ovStr || overlayApplied != ovApplied;
             if (craftOv && !stale && CraftPartCount() != ovCount) stale = true;
+            if (!stale && IsEditorTok(tok) && Quaternion.Angle(pv.transform.rotation, ovRot) > 0.5f) stale = true;
             if (stale && craftOv && ovPart != null && Time.realtimeSinceStartup - ovBuiltAt < 0.25f) stale = false;
             if (stale)
             {
@@ -3279,6 +3308,7 @@ namespace ReforgedRedux
         void ApplyBrush(List<Part> parts, bool spot)
         {
             if (parts.Count > 0) lastPaintedPart = parts[0];
+            symSource.Clear();
             if (spot && paintSym)
             {
                 List<Part> extra = new List<Part>();
@@ -3289,7 +3319,7 @@ namespace ReforgedRedux
                     for (int k = 0; k < pt.symmetryCounterparts.Count; k++)
                     {
                         Part sc = pt.symmetryCounterparts[k];
-                        if (sc != null && !parts.Contains(sc) && !extra.Contains(sc)) extra.Add(sc);
+                        if (sc != null && !parts.Contains(sc) && !extra.Contains(sc)) { extra.Add(sc); symSource[sc] = pt; }
                     }
                 }
                 parts.AddRange(extra);
@@ -3358,7 +3388,7 @@ namespace ReforgedRedux
                         }
                         else
                         {
-                            mod.AppendStack(IsCraftTok(CurRegion()) ? ModuleReforged.PlaceStack(brComboStack, PartPlace(parts[i], CurRegion())) : brComboStack);
+                            mod.AppendStack(NeedsPlace(CurRegion()) ? ModuleReforged.PlaceStack(brComboStack, PartPlace(parts[i], CurRegion())) : brComboStack);
                             if (brCombo != null)
                             {
                                 if (brCombo.hasFinish && brCombo.hasColor)
@@ -3383,6 +3413,7 @@ namespace ReforgedRedux
                         break;
                 }
             }
+            symSource.Clear();
             ScreenMessages.PostScreenMessage(spot ? Loc.T("#RDX_MsgSpotApplied", "Spot: '<<1>>' -> <<2>> parts", brushLabel, n) : Loc.T("#RDX_MsgVesselApplied", "Vessel: '<<1>>' -> <<2>> parts", brushLabel, n),
                 3f, ScreenMessageStyle.UPPER_CENTER);
         }
@@ -3538,10 +3569,61 @@ namespace ReforgedRedux
             int c = Mathf.Clamp(Mathf.RoundToInt(regCut * 100f), 0, 100);
             int f = Mathf.Clamp(Mathf.RoundToInt(regFade * 100f), 0, 100);
             int h = Mathf.Clamp(Mathf.RoundToInt(regHeight * 100f), 0, 100);
-            return (regCraft ? "c" : "g") + regAxis + "_" + c.ToString("00") + "_" + f.ToString("00") + "_" + h.ToString("00");
+            return (regCraft ? "c" : (regEditor ? "e" : "g")) + regAxis + "_" + c.ToString("00") + "_" + f.ToString("00") + "_" + h.ToString("00");
         }
 
         static bool IsCraftTok(string t) { return t != null && t.Length > 1 && t[0] == 'c' && char.IsDigit(t[1]); }
+        // "e" = per-part region measured along the editor's axes instead of the part's own (UI-only token,
+        // converted to a part-local "pl|" plane token by PartPlace before it reaches a module).
+        static bool IsEditorTok(string t) { return t != null && t.Length > 1 && t[0] == 'e' && char.IsDigit(t[1]); }
+        static bool NeedsPlace(string t) { return IsCraftTok(t) || IsEditorTok(t); }
+
+        // Craft frame: editor world axes in the VAB/SPH (SPH: +Z = nose, +X = right wing, +Y = up), the
+        // root part's axes in flight (same convention as the "Whole craft" region).
+        bool CraftFrame(Vector3 ldir, out Vector3 wdir, out Vector3 up)
+        {
+            wdir = ldir.normalized; up = Vector3.up;
+            if (HighLogic.LoadedSceneIsEditor) return true;
+            Part root = CraftAnchor();
+            if (root == null) return false;
+            wdir = root.transform.TransformDirection(ldir).normalized; up = root.transform.up;
+            return true;
+        }
+
+        string EditorPlace(Part p, string tok)
+        {
+            Vector3 ldir, wdir, up; float lcut, lfade, lheight;
+            string gtok = "g" + tok.Substring(1);
+            if (!WeatherCache.RegionAxisDir(gtok, out ldir, out lcut, out lfade, out lheight)) return "whole";
+            if (!CraftFrame(ldir, out wdir, out up)) return gtok;
+            Part src;
+            if (symSource.TryGetValue(p, out src) && src != null) SymMap(src, p, ref wdir, ref up);
+            ModuleReforged m = p.Modules.GetModule<ModuleReforged>();
+            string pl = (m != null) ? m.AxisPlaneToken(wdir, up, lcut, lfade, lheight) : null;
+            return pl ?? "whole";
+        }
+
+        // Symmetry copies added by "Symmetry paint" -> the painted part they copy. Editor-relative sides
+        // are carried over the way the copy itself was placed: reflected for mirror symmetry (left wing's
+        // outer half -> right wing's outer half), rotated with the copy for radial symmetry.
+        readonly Dictionary<Part, Part> symSource = new Dictionary<Part, Part>();
+
+        static void SymMap(Part src, Part dst, ref Vector3 wdir, ref Vector3 up)
+        {
+            if (dst.symMethod == SymmetryMethod.Mirror)
+            {
+                Vector3 n = dst.transform.position - src.transform.position;
+                if (n.sqrMagnitude < 1e-8f) return;
+                n.Normalize();
+                wdir = wdir - 2f * Vector3.Dot(wdir, n) * n;
+                up = up - 2f * Vector3.Dot(up, n) * n;
+            }
+            else
+            {
+                Quaternion q = dst.transform.rotation * Quaternion.Inverse(src.transform.rotation);
+                wdir = q * wdir; up = q * up;
+            }
+        }
 
         Part CraftAnchor()
         {
@@ -3588,13 +3670,7 @@ namespace ReforgedRedux
             if (!WeatherCache.RegionAxisDir("g" + tok.Substring(1), out ldir, out lcut, out lfade, out lheight)) return false;
             List<Part> ps = GetParts();
             if (ps.Count == 0) return false;
-            if (HighLogic.LoadedSceneIsEditor) { ccW = ldir.normalized; ccU = Vector3.up; }
-            else
-            {
-                Part root = CraftAnchor();
-                if (root == null) return false;
-                ccW = root.transform.TransformDirection(ldir).normalized; ccU = root.transform.up;
-            }
+            if (!CraftFrame(ldir, out ccW, out ccU)) return false;
             float lo = float.MaxValue, hi = float.MinValue, vlo = float.MaxValue, vhi = float.MinValue;
             for (int i = 0; i < ps.Count; i++) if (ps[i] != null) CraftExtentPart(ps[i], ref lo, ref hi, ref vlo, ref vhi);
             if (hi - lo < 1e-4f) return false;
@@ -3631,7 +3707,9 @@ namespace ReforgedRedux
 
         string PartPlace(Part p, string tok)
         {
-            if (p == null || !IsCraftTok(tok)) return tok;
+            if (p == null) return tok;
+            if (IsEditorTok(tok)) return EditorPlace(p, tok);
+            if (!IsCraftTok(tok)) return tok;
             if (!CraftCut(tok)) return "whole";
             return ModuleReforged.PlaneToken(p.transform, ccW, ccCw, ccFw, ccUseH, ccU, ccH, ccFh);
         }
@@ -3657,6 +3735,14 @@ namespace ReforgedRedux
                 int nc0 = GUILayout.Toolbar(regCraft ? 1 : 0, new string[] { Loc.T("#RDX_RegEachPart", "Each part"), Loc.T("#RDX_RegWholeCraft", "Whole craft") });
                 if ((nc0 == 1) != regCraft) { regCraft = nc0 == 1; ch = true; }
                 if (regCraft) Hint(Loc.T("#RDX_HintRegCraft", "One slice across the whole craft, like the top half\nof a rocket or one side of a plane."));
+                else
+                {
+                    bool ne = GUILayout.Toggle(regEditor, "<b>" + Loc.T("#RDX_RegEditorAxes", "Editor-relative sides") + "</b>", toggleBold);
+                    if (ne != regEditor) { regEditor = ne; ch = true; SavePresets(); }
+                    Hint(regEditor
+                        ? Loc.T("#RDX_HintRegEditorOn", "Sides follow the editor, not the part: Btm is always\nthe craft's bottom, Left/Right as seen from behind\n(SPH: from the tail). Each part is still sliced on its own.")
+                        : Loc.T("#RDX_HintRegEditorOff", "Sides follow each part's own orientation."));
+                }
                 int ns = GUILayout.Toolbar(regAxis, new string[] { Loc.T("#RDX_AxTop", "Top"), Loc.T("#RDX_AxBtm", "Btm"), Loc.T("#RDX_AxFront", "Front"), Loc.T("#RDX_AxBack", "Back"), Loc.T("#RDX_AxLeft", "Left"), Loc.T("#RDX_AxRight", "Right") });
                 if (ns != regAxis) { regAxis = ns; ch = true; }
                 float nc = SliderNum(Loc.T("#RDX_Cutoff", "Cutoff"), regCut, 0f, 1f, ref regCutBuf);
@@ -4905,6 +4991,7 @@ namespace ReforgedRedux
                 { string lv = root.GetValue("lowVram"); if (lv != null) WeatherCache.LowVram = lv == "True"; }
                 { int cl; if (int.TryParse(root.GetValue("cacheLimitMB"), out cl) && Array.IndexOf(CacheLimits, cl) >= 0) WeatherCache.CacheLimitMB = cl; }
                 { string sy = root.GetValue("symPaint"); if (sy != null) paintSym = sy != "False"; }
+                { string re = root.GetValue("regionEditorAxes"); if (re != null) regEditor = re == "True"; }
                 ModuleReforged.IgnoredParts.Clear();
                 ConfigNode[] igs = root.GetNodes("REDUX_IGNORE");
                 for (int i = 0; i < igs.Length; i++)
@@ -5002,6 +5089,7 @@ namespace ReforgedRedux
                 root.AddValue("lowVram", WeatherCache.LowVram);
                 root.AddValue("cacheLimitMB", WeatherCache.CacheLimitMB);
                 root.AddValue("symPaint", paintSym);
+                root.AddValue("regionEditorAxes", regEditor);
                 foreach (string ipn in ModuleReforged.IgnoredParts) root.AddNode("REDUX_IGNORE").AddValue("name", ipn);
                 for (int bi = 0; bi < binds.Length; bi++) root.AddValue("key_" + binds[bi].id, BindSave(binds[bi]));
                 string path = PresetsPath();
