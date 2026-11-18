@@ -2384,7 +2384,9 @@ namespace ReforgedRedux
         int heatVariant;
         bool showOverlay = true;
         static bool showHints = true;
-        static float savedWinW = 360f, savedWinH = 520f;
+        // savedWinH 0 = auto (80% of the screen); the old fixed default (520) is migrated to auto on load.
+        static float savedWinW = 360f, savedWinH = 0f;
+        float AutoWinH() { return Mathf.Max(520f, Screen.height / uiScale * 0.8f); }
         static float uiScale = 1f;
         float scaleReq;
         GUIStyle tinyBtn;
@@ -2798,7 +2800,7 @@ namespace ReforgedRedux
         Part pickPart;
         bool overlayApplied, ovApplied;
         Part lastHovered;
-        GUIStyle headerStyle, hintStyle, builderLabel, toggleBold, brushStyle, pressStyle;
+        GUIStyle headerStyle, hintStyle, builderLabel, toggleBold, toggleRow, brushStyle, pressStyle;
 
         class UndoEntry
         {
@@ -2827,7 +2829,7 @@ namespace ReforgedRedux
             if (!presetsLoaded) { LoadPresets(); presetsLoaded = true; }
             if (!versionLogged) { versionLogged = true; Debug.Log("[ReforgedRedux] Reforged Materials Redux v" + Version + " loaded"); }
             win.width = Mathf.Clamp(savedWinW, 300f, 700f);
-            win.height = Mathf.Clamp(savedWinH, 220f, Screen.height / uiScale);
+            win.height = Mathf.Clamp(savedWinH > 0f ? savedWinH : AutoWinH(), 220f, Screen.height / uiScale);
             brushLabel = Loc.T("#RDX_LblNone", "(none yet)");
             newName = Loc.T("#RDX_DefPreset", "My preset");
             comboName = Loc.T("#RDX_DefCombo", "My combo");
@@ -3881,6 +3883,16 @@ namespace ReforgedRedux
                 pressStyle.richText = true;
                 toggleBold = new GUIStyle(GUI.skin.toggle);
                 toggleBold.richText = true;
+                // Text-only measuring copy of the toggle style (see ToggleSlot).
+                toggleRow = new GUIStyle(toggleBold);
+                toggleRow.wordWrap = false;
+                toggleRow.fixedWidth = 0f; toggleRow.fixedHeight = 0f;
+                toggleRow.padding = new RectOffset(0, 0, 0, 0);
+                toggleRow.contentOffset = Vector2.zero;
+                GUIStyle ts = GUI.skin.toggle;
+                Debug.Log("[ReforgedRedux] toggle style: fixedWidth " + ts.fixedWidth + ", fixedHeight " + ts.fixedHeight
+                    + ", padding " + ts.padding + ", contentOffset " + ts.contentOffset + ", wordWrap " + ts.wordWrap
+                    + ", clipping " + ts.clipping);
             }
 
             if (tinyBtn == null)
@@ -3953,6 +3965,27 @@ namespace ReforgedRedux
 
         void Hint(string s) { if (showHints) GUILayout.Label(s, hintStyle); }
 
+        // Usable content width below the tab's scroll view (window minus its padding).
+        float BottomW() { return Mathf.Max(120f, gridW - 30f); }
+
+        // Width a toggle really covers on screen: checkbox offset + its label, at least the style's own width.
+        float ToggleSlot(GUIContent c)
+        {
+            float off = toggleBold.padding.left + Mathf.Max(0f, toggleBold.contentOffset.x);
+            return Mathf.Max(toggleBold.fixedWidth, off + toggleRow.CalcSize(c).x + toggleBold.padding.right);
+        }
+
+        // slot > 0: inside a horizontal row, take exactly `slot` of width (the toggle keeps the skin's own size,
+        // the rest is reserved for its spilling label). slot 0: a row of its own, as the skin draws it.
+        bool SlotToggle(bool v, GUIContent c, float slot)
+        {
+            if (slot <= 0f) return GUILayout.Toggle(v, c, toggleBold);
+            if (toggleBold.fixedWidth <= 0f) return GUILayout.Toggle(v, c, toggleBold, GUILayout.Width(slot));
+            bool r = GUILayout.Toggle(v, c, toggleBold);
+            GUILayout.Space(Mathf.Max(0f, slot - toggleBold.fixedWidth - toggleBold.margin.horizontal));
+            return r;
+        }
+
         void DrawWindow(int id)
         {
             if (Event.current.type == EventType.Layout) gridW = win.width;
@@ -3979,11 +4012,20 @@ namespace ReforgedRedux
             else
             {
                 GUILayout.Label(Loc.T("#RDX_PressHovered", "Press P to paint the hovered part."), pressStyle);
-                includeChildren = GUILayout.Toggle(includeChildren, "<b>" + Loc.T("#RDX_IncludeAttached", "Include attached parts") + "</b>", toggleBold);
-                Hint(Loc.T("#RDX_HintAttached", "Also paints the parts attached onto the hovered part."));
-                bool nSym = GUILayout.Toggle(paintSym, "<b>" + Loc.T("#RDX_SymmetryPaint", "Symmetry paint") + "</b>", toggleBold);
+                // Side by side only when both fit on one row at the current window width, else stacked. The
+                // skin's toggle is a fixed-width checkbox whose label spills past its rect, so a second toggle
+                // placed right after it lands on top of that label: each toggle's row slot is reserved explicitly.
+                GUIContent incC = new GUIContent("<b>" + Loc.T("#RDX_IncludeAttached", "Include attached parts") + "</b>");
+                GUIContent symC = new GUIContent("<b>" + Loc.T("#RDX_SymmetryPaint", "Symmetry paint") + "</b>");
+                float incW = ToggleSlot(incC), symW = ToggleSlot(symC);
+                bool oneRow = incW + symW + 12f <= BottomW();
+                if (oneRow) GUILayout.BeginHorizontal();
+                includeChildren = SlotToggle(includeChildren, incC, oneRow ? incW : 0f);
+                if (oneRow) GUILayout.Space(12f);
+                bool nSym = SlotToggle(paintSym, symC, oneRow ? symW : 0f);
+                if (oneRow) { GUILayout.FlexibleSpace(); GUILayout.EndHorizontal(); }
                 if (nSym != paintSym) { paintSym = nSym; SavePresets(); }
-                Hint(Loc.T("#RDX_HintSym", "Also paints the part's symmetry copies."));
+                Hint(Loc.T("#RDX_HintAttached", "Also paints the parts attached onto the hovered part.") + "\n" + Loc.T("#RDX_HintSym", "Also paints the part's symmetry copies."));
             }
             GUILayout.Space(4f);
             GUILayout.BeginHorizontal();
@@ -3994,7 +4036,8 @@ namespace ReforgedRedux
                 GUI.DrawTexture(ir, brIcon, ScaleMode.StretchToFill, true);
                 GUI.color = oc;
             }
-            GUILayout.Label(brushLabel, brushStyle);
+            // Explicit width: a word-wrapping label in a horizontal group otherwise wraps at a few characters.
+            GUILayout.Label(brushLabel, brushStyle, GUILayout.Width(Mathf.Max(80f, BottomW() - (brIcon != null ? 44f : 0f))));
             GUILayout.EndHorizontal();
             if (tab == 0)
             {
@@ -4409,9 +4452,8 @@ namespace ReforgedRedux
                 Hint(Loc.T("#RDX_HintDetail", "0 = solid colour. Higher keeps hard details\n(panel lines, edges); flat areas stay solid."));
             }
             Header(Loc.T("#RDX_HdrColours", "Colours"));
-            float colAvail = Mathf.Clamp(win.height - (buildingColor ? 560f : 310f), 150f, 1200f);
-            float colH = (colContentH > 0f) ? Mathf.Min(colContentH + 4f, colAvail) : colAvail;
-            colScroll = GUILayout.BeginScrollView(colScroll, false, false, GUIStyle.none, GUI.skin.verticalScrollbar, GUILayout.Height(colH));
+            // Laid out inline in the tab's own scroll view (was a nested scroll view clamped to
+            // window height - 310 px, i.e. only ~5 rows on a normal-size window).
             float colCw;
             int colCols = GridCols(ColWs, out colCw);
             for (int i = 0; i < palNames.Count; i += colCols)
@@ -4428,8 +4470,6 @@ namespace ReforgedRedux
                 }
                 GUILayout.EndHorizontal();
             }
-            if (palNames.Count > 0 && Event.current.type == EventType.Repaint) colContentH = GUILayoutUtility.GetLastRect().yMax;
-            GUILayout.EndScrollView();
             Header(Loc.T("#RDX_HdrMyColours", "My colours"));
             DrawUserPresets(userColor, true);
             if (GUILayout.Button(buildingColor ? Loc.T("#RDX_CloseBuilder", "Close builder") : Loc.T("#RDX_CreateColourPreset", "Create colour preset +"), GUILayout.Height(26f)))
@@ -4752,9 +4792,7 @@ namespace ReforgedRedux
             if (dirtSearch.Length > 0 && GUILayout.Button("x", GUILayout.Width(22f), GUILayout.Height(20f))) dirtSearch = "";
             GUILayout.EndHorizontal();
             GUILayout.Label(Loc.T("#RDX_AllPatterns", "All patterns (tick = pin a favorite):"), hintStyle);
-            float dirtAvail = Mathf.Clamp(win.height - 330f, 150f, 1200f);
-            float dirtH = (dirtContentH > 0f) ? Mathf.Min(dirtContentH + 4f, dirtAvail) : dirtAvail;
-            dirtScroll = GUILayout.BeginScrollView(dirtScroll, false, false, GUIStyle.none, GUI.skin.verticalScrollbar, GUILayout.Height(dirtH));
+            // Inline in the tab's scroll view (was a nested ~5-row scroll view); the search box above filters it.
             string dq = dirtSearch.ToLowerInvariant();
             int dirtDrawn = 0;
             for (int i = 0; i < WeatherLabels.Count; i++)
@@ -4772,8 +4810,7 @@ namespace ReforgedRedux
                 GUILayout.EndHorizontal();
                 dirtDrawn++;
             }
-            if (Event.current.type == EventType.Repaint) dirtContentH = (dirtDrawn > 0) ? GUILayoutUtility.GetLastRect().yMax : 24f;
-            GUILayout.EndScrollView();
+            if (dirtDrawn == 0) GUILayout.Label("-", hintStyle);
             Hint(Loc.T("#RDX_HintStack", "Effects stack. Colourless textures take any\ntint below or a colour from the Colour tab."));
             GUILayout.Space(4f);
             Header(Loc.T("#RDX_HdrTinted", "Tinted worn looks"));
@@ -4896,7 +4933,7 @@ namespace ReforgedRedux
                 { string cr = root.GetValue("colorReplace"); if (cr != null) WeatherCache.ColorReplace = cr != "False"; }
                 { string ts = root.GetValue("detailThroughTex"); if (ts != null) WeatherCache.TexSkipDetail = ts == "True"; }
                 { float ww; if (float.TryParse(root.GetValue("winW"), out ww) && ww > 0f) savedWinW = Mathf.Clamp(ww, 300f, 700f); }
-                { float wh; if (float.TryParse(root.GetValue("winH"), out wh) && wh > 0f) savedWinH = Mathf.Max(220f, wh); }
+                { float wh; if (float.TryParse(root.GetValue("winH"), out wh) && wh > 0f) savedWinH = Mathf.Abs(wh - 520f) < 0.5f ? 0f : Mathf.Max(220f, wh); }
                 { float us; if (float.TryParse(root.GetValue("uiScale"), out us) && us > 0f) uiScale = Mathf.Clamp(us, 0.6f, 1.6f); }
                 { string gl = root.GetValue("gradualLoad"); if (gl != null) ModuleReforged.DeferLoadBakes = gl == "True"; }
                 { string es = root.GetValue("evenShine"); if (es != null) ModuleReforged.EvenShine = es != "False"; }
