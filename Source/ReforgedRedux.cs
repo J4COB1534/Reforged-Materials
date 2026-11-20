@@ -1067,6 +1067,7 @@ namespace ReforgedRedux
             for (int j = 0; j < n; j++) outside[j] = (pris[j] != null) ? StockCopy(pris[j]) : null;
             Material[] inMats = (target == 1) ? outside : work;
             Material[] outMats = (target == 1) ? work : outside;
+            string inZ = (target == 1) ? null : ActiveRegion(), outZ = (target == 1) ? ActiveRegion() : null;
             Mesh curMesh = MeshOf(r);
             Mesh src = null;
             if (curMesh != null)
@@ -1078,6 +1079,7 @@ namespace ReforgedRedux
             if (src == null || !src.isReadable || src.subMeshCount != n || work.Length != n || !SkinOk(r, src))
             {
                 r.materials = centerIn ? inMats : outMats;
+                zoneSlots[r] = FillSlots(n, centerIn ? inZ : outZ);
                 return true;
             }
             try
@@ -1087,7 +1089,9 @@ namespace ReforgedRedux
                 List<BoneWeight> W = SkinWeights(src, r);
                 List<List<int>> subTris = new List<List<int>>();
                 List<Material> subMats = new List<Material>();
+                List<string> subZone = new List<string>();
                 Material[] whole = new Material[n];
+                string[] wholeZ = new string[n];
                 bool split = false;
                 for (int j = 0; j < n; j++)
                 {
@@ -1101,14 +1105,17 @@ namespace ReforgedRedux
                         ClipSoup(V, N, T, U, W, r.transform, -upDir, -cwHeight, keep1, keep2, drop2);
                         painted = keep2; stock = drop1; stock.AddRange(drop2);
                     }
-                    if (painted.Count > 0) { subTris.Add(painted); subMats.Add(inMats[j]); }
-                    if (stock.Count > 0) { subTris.Add(stock); subMats.Add(outMats[j]); }
+                    if (painted.Count > 0) { subTris.Add(painted); subMats.Add(inMats[j]); subZone.Add(inZ); }
+                    if (stock.Count > 0) { subTris.Add(stock); subMats.Add(outMats[j]); subZone.Add(outZ); }
                     if (painted.Count > 0 && stock.Count > 0) split = true;
-                    whole[j] = (painted.Count > 0 || (stock.Count == 0 && centerIn)) ? inMats[j] : outMats[j];
+                    bool wIn = painted.Count > 0 || (stock.Count == 0 && centerIn);
+                    whole[j] = wIn ? inMats[j] : outMats[j];
+                    wholeZ[j] = wIn ? inZ : outZ;
                 }
                 if (!split)
                 {
                     r.materials = whole;
+                    zoneSlots[r] = wholeZ;
                     return true;
                 }
                 Mesh nm = new Mesh();
@@ -1123,12 +1130,14 @@ namespace ReforgedRedux
                 nm.RecalculateBounds();
                 TrackSplit(r, nm);
                 r.materials = subMats.ToArray();
+                zoneSlots[r] = subZone.ToArray();
                 return true;
             }
             catch (Exception e)
             {
                 Debug.LogWarning("[ReforgedRedux] region split failed: " + e.Message);
                 r.materials = centerIn ? inMats : outMats;
+                zoneSlots[r] = FillSlots(n, centerIn ? inZ : outZ);
                 return true;
             }
         }
@@ -1154,6 +1163,7 @@ namespace ReforgedRedux
         {
             if (part == null || excludedPart) return;
             ReleaseLeavers(false);
+            zoneSlots.Clear();
             if (!Active) { RestoreOriginals(); FixDecals(); return; }
             WeatherCache.PaintDetailCur = rdxPaintDetail;
             WeatherCache.TexSkipCur = rdxTexDetail;
@@ -1289,7 +1299,21 @@ namespace ReforgedRedux
                     work[j] = m;
                 }
                 if (!AssignRegionSplit(r, work, pris, geomRegion, wdir, cw, upDir, cwHeight, useHeight, rdxShineSpot))
+                {
                     r.materials = work;
+                    string[] sl = new string[work.Length];
+                    for (int j = 0; j < sl.Length; j++)
+                    {
+                        bool painted = work[j] != null;
+                        if (pickMode)
+                        {
+                            bool mtc = RelPath(r.transform, part.transform) + "#" + j == pickTarget;
+                            painted = painted && ((rdxShineSpot == 2) || (rdxShineSpot == 1 ? !mtc : mtc));
+                        }
+                        sl[j] = painted ? ActiveRegion() : null;
+                    }
+                    zoneSlots[r] = sl;
+                }
             }
 
             PadMaterials(rs);
@@ -1418,6 +1442,59 @@ namespace ReforgedRedux
             m.shineSpot = z.shineSpot;
             m.scale = (z.scale != 1f) ? z.scale : baseZ.scale;
             return m;
+        }
+
+        // Which zone painted each material slot (= submesh of the current mesh) of each renderer, filled by
+        // the rebuilds; GeoSlot = one combined fade material, resolved geometrically. Used by the eraser.
+        readonly Dictionary<Renderer, string[]> zoneSlots = new Dictionary<Renderer, string[]>();
+        const string GeoSlot = "~geo";
+        static string[] FillSlots(int n, string z) { string[] a = new string[n]; for (int i = 0; i < n; i++) a[i] = z; return a; }
+        string ActiveRegion() { return string.IsNullOrEmpty(rdxRegion) ? "whole" : rdxRegion; }
+        static string ZoneName(string region) { return string.IsNullOrEmpty(region) ? "whole" : region; }
+
+        // The zone whose paint is on material slot 'slot' of renderer 'r' at world point 'wp'; null = stock there.
+        internal string ZoneAt(Renderer r, int slot, Vector3 wp)
+        {
+            string[] zs;
+            if (r == null || !zoneSlots.TryGetValue(r, out zs) || zs == null || slot < 0 || slot >= zs.Length) return null;
+            if (zs[slot] != GeoSlot) return zs[slot];
+            List<Zone> all = AllZones();
+            List<Renderer> rs = OwnRenderers();
+            for (int i = all.Count - 1; i >= 0; i--)
+            {
+                string rg = all[i].region;
+                if (rg != null && (rg.StartsWith("g") || IsPlaneTok(rg)) && InZone(ZoneGeoOf(rg, rs), wp)) return rg;
+            }
+            Zone w = all.Find(delegate(Zone z) { return ZoneName(z.region) == "whole"; });
+            return (w != null && w.HasContent) ? "whole" : null;
+        }
+
+        // Paint zones in paint order (oldest first, the active one last).
+        internal List<string> ZoneRegions()
+        {
+            List<string> l = new List<string>();
+            List<Zone> all = AllZones();
+            for (int i = 0; i < all.Count; i++) l.Add(ZoneName(all[i].region));
+            return l;
+        }
+
+        // Removes one zone's paint (finish, colour, patterns); the paint under it shows again.
+        public bool EraseZone(string region)
+        {
+            if (string.IsNullOrEmpty(region)) return false;
+            bool hit = false;
+            if (ActiveRegion() == region && ActiveZone().HasContent)
+            {
+                rdxFinish = false; rdxColored = false; rdxStack = "";
+                hit = true;
+            }
+            List<Zone> ex = ParseZones(rdxZones);
+            if (ex.RemoveAll(delegate(Zone z) { return ZoneName(z.region) == region; }) > 0) hit = true;
+            if (!hit) return false;
+            rdxZones = SerZones(ex);
+            UpdateHeatBuff();
+            Rebuild();
+            return true;
         }
 
         public void ClearWeatherAll()
@@ -1809,15 +1886,18 @@ namespace ReforgedRedux
                                 combined = BuildSmoothFadeMaterial(combined, geo[z], MaskUsable(cm) ? cm : null);
                             }
                             r.materials = new Material[] { combined };
+                            zoneSlots[r] = new string[] { GeoSlot };
                             continue;
                         }
                         List<List<int>> subTris = new List<List<int>>();
                         List<Material> subMats = new List<Material>();
+                        List<string> subZone = new List<string>();
+                        string restZ = (baseZone != null && baseZone.HasContent) ? "base" : ((whole != null && whole.HasContent) ? "whole" : null);
                         geo.Reverse();
                         for (int j = 0; j < pris.Length; j++)
                         {
                             List<int> pool = (pris.Length == 1) ? tris : new List<int>(src.GetTriangles(j));
-                            if (pris[j] == null) { if (pool.Count > 0) { subTris.Add(pool); subMats.Add(null); } continue; }
+                            if (pris[j] == null) { if (pool.Count > 0) { subTris.Add(pool); subMats.Add(null); subZone.Add(null); } continue; }
                             bool fadedHere = false;
                             for (int z = 0; z < geo.Count; z++)
                             {
@@ -1855,9 +1935,10 @@ namespace ReforgedRedux
                                     }
                                     Material baseMat = (whole != null && whole.HasContent) ? BuildZoneMaterial(pris[j], whole) : pris[j];
                                     subTris.Add(painted); subMats.Add(BuildSmoothFadeMaterial(baseMat, geo[z], MaskUsable(cm) ? cm : null));
+                                    subZone.Add(geo[z].region);
                                     fadedHere = true;
                                 }
-                                else { subTris.Add(painted); subMats.Add(BuildZoneMaterial(pris[j], mz)); }
+                                else { subTris.Add(painted); subMats.Add(BuildZoneMaterial(pris[j], mz)); subZone.Add(geo[z].region); }
                             }
                             if (pool.Count > 0)
                             {
@@ -1866,6 +1947,7 @@ namespace ReforgedRedux
                                               : (fadedHere ? BlitStock(pris[j]) : StockCopy(pris[j]));
                                 subTris.Add(pool);
                                 subMats.Add(rest);
+                                subZone.Add(restZ);
                             }
                         }
                         if (subTris.Count == 0)
@@ -1873,6 +1955,7 @@ namespace ReforgedRedux
                             Material[] sc = new Material[pris.Length];
                             for (int j = 0; j < pris.Length; j++) sc[j] = (pris[j] != null) ? StockCopy(pris[j]) : null;
                             r.materials = sc;
+                            zoneSlots[r] = new string[sc.Length];
                             continue;
                         }
                         Mesh nm = new Mesh();
@@ -1887,21 +1970,25 @@ namespace ReforgedRedux
                         nm.RecalculateBounds();
                         TrackSplit(r, nm);
                         r.materials = subMats.ToArray();
+                        zoneSlots[r] = subZone.ToArray();
                     }
                     catch (Exception e) { Debug.LogWarning("[ReforgedRedux] multi-zone split failed: " + e.Message); }
                 }
                 else if (pick.Count > 0)
                 {
                     Material[] work = new Material[pris.Length];
+                    string[] sl = new string[pris.Length];
+                    string restZ = (baseZone != null && baseZone.HasContent) ? "base" : ((whole != null && whole.HasContent) ? "whole" : null);
                     for (int j = 0; j < pris.Length; j++)
                     {
                         if (pris[j] == null) { work[j] = null; continue; }
                         string key = "pick|" + RelPath(r.transform, part.transform) + "#" + j;
                         Zone pz = pick.Find(delegate(Zone z) { return z.region == key; });
-                        if (pz != null) work[j] = BuildZoneMaterial(pris[j], MergeBase(whole, pz));
-                        else { Zone lz = (baseZone != null && baseZone.HasContent) ? MergeBase(whole, baseZone) : whole; work[j] = (lz != null && lz.HasContent) ? BuildZoneMaterial(pris[j], lz) : StockCopy(pris[j]); }
+                        if (pz != null) { work[j] = BuildZoneMaterial(pris[j], MergeBase(whole, pz)); sl[j] = key; }
+                        else { Zone lz = (baseZone != null && baseZone.HasContent) ? MergeBase(whole, baseZone) : whole; work[j] = (lz != null && lz.HasContent) ? BuildZoneMaterial(pris[j], lz) : StockCopy(pris[j]); sl[j] = (lz != null && lz.HasContent) ? restZ : null; }
                     }
                     r.materials = work;
+                    zoneSlots[r] = sl;
                 }
                 else
                 {
@@ -1909,6 +1996,7 @@ namespace ReforgedRedux
                     for (int z = geo.Count - 1; z >= 0 && gz == null; z--)
                         if (InZone(ZoneGeoOf(geo[z].region, rs), r.bounds.center)) gz = geo[z];
                     Zone lz = (gz != null) ? MergeBase(whole, gz) : ((baseZone != null && baseZone.HasContent) ? MergeBase(whole, baseZone) : whole);
+                    string lzName = (gz != null) ? gz.region : ((baseZone != null && baseZone.HasContent) ? "base" : "whole");
                     Material[] work = new Material[pris.Length];
                     for (int j = 0; j < pris.Length; j++)
                     {
@@ -1916,6 +2004,7 @@ namespace ReforgedRedux
                         work[j] = (lz != null && lz.HasContent) ? BuildZoneMaterial(pris[j], lz) : StockCopy(pris[j]);
                     }
                     r.materials = work;
+                    zoneSlots[r] = FillSlots(work.Length, (lz != null && lz.HasContent) ? lzName : null);
                 }
             }
             PadMaterials(rs);
@@ -2433,7 +2522,8 @@ namespace ReforgedRedux
             new KeyBind("resetBrush", KeyCode.None),
             new KeyBind("toggleMenu", KeyCode.None),
             new KeyBind("pick", KeyCode.Mouse2),
-            new KeyBind("pin", KeyCode.Mouse1)
+            new KeyBind("pin", KeyCode.Mouse1),
+            new KeyBind("erase", KeyCode.O)
         };
         static KeyBind Bind(string id) { for (int i = 0; i < binds.Length; i++) if (binds[i].id == id) return binds[i]; return null; }
 
@@ -2447,6 +2537,7 @@ namespace ReforgedRedux
                 case "resetBrush": return Loc.T("#RDX_KeyResetBrush", "Reset brush to stock");
                 case "pick": return Loc.T("#RDX_KeyPick", "Pick piece");
                 case "pin": return Loc.T("#RDX_KeyPin", "Pin preview");
+                case "erase": return Loc.T("#RDX_KeyErase", "Erase paint under cursor");
                 default: return Loc.T("#RDX_KeyToggleMenu", "Show / hide menu");
             }
         }
@@ -2940,6 +3031,7 @@ namespace ReforgedRedux
             if (show && hotkeys && BindDown("undo")) { UndoLast(); return; }
             if (show && hotkeys && BindDown("redo")) { RedoLast(); return; }
             if (show && hotkeys && BindDown("resetBrush")) { brushKind = 6; brushLabel = Loc.T("#RDX_LblResetStock", "Reset to stock"); brIcon = null; return; }
+            if (show && hotkeys && BindDown("erase") && !MouseOverMenus()) { DoErase(Input.mousePosition); return; }
             if (show && hotkeys && BindDown("paint") && brushKind != 0)
             {
                 overlayApplied = true;
@@ -3163,6 +3255,74 @@ namespace ReforgedRedux
             }
             else ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgNoMesh", "No mesh under the cursor - this part may not be splittable."), 4f, ScreenMessageStyle.UPPER_CENTER);
         }
+        // Eraser: removes the paint zone (region/pick/whole layer) under the cursor on the hovered part, and the
+        // matching zone on its symmetry copies when Symmetry paint is on. The paint below it shows again.
+        void DoErase(Vector3 mousePos)
+        {
+            Part part = Mouse.HoveredPart;
+            Camera cam = Camera.main;
+            if (part == null || cam == null) { ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgPointPart", "Point at a part first, then press <<1>>.", BindName("erase")), 3f, ScreenMessageStyle.UPPER_CENTER); return; }
+            ModuleReforged mod = part.Modules.GetModule<ModuleReforged>();
+            if (mod == null || mod.Excluded) return;
+            Ray ray = cam.ScreenPointToRay(mousePos);
+            Transform mroot = part.transform.Find("model");
+            Renderer[] rs = (mroot != null ? mroot : part.transform).GetComponentsInChildren<Renderer>(true);
+            float bestT = float.MaxValue; Renderer bestR = null; int bestSub = -1;
+            for (int i = 0; i < rs.Length; i++)
+            {
+                Renderer r = rs[i];
+                if (r == null || ModuleReforged.SkipRenderer(r) || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                Part owner = r.GetComponentInParent<Part>(); if (owner != null && owner != part) continue;
+                Mesh msh = ModuleReforged.MeshOf(r);
+                if (msh == null || !msh.isReadable) continue;
+                Vector3[] vs = msh.vertices; Transform t = r.transform;
+                for (int sub = 0; sub < msh.subMeshCount; sub++)
+                {
+                    int[] tr = msh.GetTriangles(sub);
+                    for (int k = 0; k + 2 < tr.Length; k += 3)
+                    {
+                        float tt;
+                        if (RayTri(ray, t.TransformPoint(vs[tr[k]]), t.TransformPoint(vs[tr[k + 1]]), t.TransformPoint(vs[tr[k + 2]]), out tt) && tt < bestT)
+                        { bestT = tt; bestR = r; bestSub = sub; }
+                    }
+                }
+            }
+            string zone = (bestR != null) ? mod.ZoneAt(bestR, bestSub, ray.GetPoint(bestT)) : null;
+            if (zone == null) { ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgNothingToErase", "No paint under the cursor."), 3f, ScreenMessageStyle.UPPER_CENTER); return; }
+            int idx = mod.ZoneRegions().IndexOf(zone);
+            List<Part> parts = new List<Part>();
+            parts.Add(part);
+            if (paintSym && part.symmetryCounterparts != null)
+                for (int k = 0; k < part.symmetryCounterparts.Count; k++)
+                    if (part.symmetryCounterparts[k] != null && !parts.Contains(part.symmetryCounterparts[k])) parts.Add(part.symmetryCounterparts[k]);
+            Snapshot(parts);
+            int n = 0;
+            for (int i = 0; i < parts.Count; i++)
+            {
+                ModuleReforged m = parts[i].Modules.GetModule<ModuleReforged>();
+                if (m == null || m.Excluded) continue;
+                string z = zone;
+                if (i > 0)
+                {
+                    // Copies painted with editor-relative/craft sides carry their own plane tokens: same token
+                    // if present, else the zone at the same paint-order position when it is the same kind.
+                    List<string> zr = m.ZoneRegions();
+                    if (!zr.Contains(z)) z = (idx >= 0 && idx < zr.Count && ZoneKind(zr[idx]) == ZoneKind(zone)) ? zr[idx] : null;
+                }
+                if (z != null && m.EraseZone(z)) n++;
+            }
+            ScreenMessages.PostScreenMessage(Loc.T("#RDX_MsgErased", "Erased paint -> <<1>> parts", n), 3f, ScreenMessageStyle.UPPER_CENTER);
+        }
+
+        static string ZoneKind(string region)
+        {
+            string r = region ?? "";
+            if (r.StartsWith("pl|")) return "pl";
+            if (r.StartsWith("pick|")) return "pick";
+            if (r.Length > 0 && r[0] == 'g') return "g";
+            return r;
+        }
+
         static bool RayTri(Ray ray, Vector3 a, Vector3 b, Vector3 c, out float t)
         {
             t = 0f;
